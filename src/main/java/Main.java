@@ -4,10 +4,14 @@ import java.nio.channels.*;
 import java.net.InetSocketAddress;
 import java.nio.charset.StandardCharsets;
 import java.util.ArrayList;
+import java.util.HashMap;
 import java.util.Iterator;
 import java.util.List;
+import java.util.Map;
 
 public class Main {
+    static final Map<String, String> store = new HashMap<>();
+
     public static void main(String[] args) {
         System.out.println("Redis server started on port 6379");
         try {
@@ -56,6 +60,14 @@ public class Main {
         return switch (command.get(0).toUpperCase()) {
             case "PING" -> "+PONG\r\n";
             case "ECHO" -> bulk(command.get(1));
+            case "SET" -> {
+                store.put(command.get(1), command.get(2));
+                yield "+OK\r\n";
+            }
+            case "GET" -> {
+                String value = store.get(command.get(1));
+                yield value == null ? "$-1\r\n" : bulk(value);
+            }
             default -> "-ERR unknown command '" + command.get(0) + "'\r\n";
         };
     }
