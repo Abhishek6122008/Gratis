@@ -11,6 +11,7 @@ import java.util.Map;
 
 public class Main {
     static final Map<String, String> store = new HashMap<>();
+    static final Map<String, Long> expiries = new HashMap<>();
 
     public static void main(String[] args) {
         System.out.println("Redis server started on port 6379");
@@ -61,15 +62,33 @@ public class Main {
             case "PING" -> "+PONG\r\n";
             case "ECHO" -> bulk(command.get(1));
             case "SET" -> {
-                store.put(command.get(1), command.get(2));
+                String key = command.get(1);
+                store.put(key, command.get(2));
+                expiries.remove(key);
+                for (int i = 3; i + 1 < command.size(); i += 2) {
+                    long amount = Long.parseLong(command.get(i + 1));
+                    switch (command.get(i).toUpperCase()) {
+                        case "EX" -> expiries.put(key, System.currentTimeMillis() + amount * 1000);
+                        case "PX" -> expiries.put(key, System.currentTimeMillis() + amount);
+                    }
+                }
                 yield "+OK\r\n";
             }
             case "GET" -> {
-                String value = store.get(command.get(1));
+                String value = get(command.get(1));
                 yield value == null ? "$-1\r\n" : bulk(value);
             }
             default -> "-ERR unknown command '" + command.get(0) + "'\r\n";
         };
+    }
+
+    static String get(String key) {
+        Long expiresAt = expiries.get(key);
+        if (expiresAt != null && System.currentTimeMillis() >= expiresAt) {
+            store.remove(key);
+            expiries.remove(key);
+        }
+        return store.get(key);
     }
 
     static String bulk(String value) {
