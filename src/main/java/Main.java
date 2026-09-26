@@ -12,6 +12,7 @@ import java.util.Map;
 public class Main {
     static final Map<String, String> store = new HashMap<>();
     static final Map<String, Long> expiries = new HashMap<>();
+    static final Map<String, List<String>> lists = new HashMap<>();
 
     public static void main(String[] args) {
         System.out.println("Redis server started on port 6379");
@@ -77,6 +78,10 @@ public class Main {
             case "GET" -> {
                 String value = get(command.get(1));
                 yield value == null ? "$-1\r\n" : bulk(value);
+            }
+            case "RPUSH" -> {
+                lists.put(command.get(1), new ArrayList<>(List.of(command.get(2))));
+                yield ":1\r\n";
             }
             default -> "-ERR unknown command '" + command.get(0) + "'\r\n";
         };
