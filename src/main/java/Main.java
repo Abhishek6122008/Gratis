@@ -81,7 +81,7 @@ public class Main {
             }
             case "RPUSH" -> {
                 List<String> list = lists.computeIfAbsent(command.get(1), k -> new ArrayList<>());
-                list.add(command.get(2));
+                list.addAll(command.subList(2, command.size()));
                 yield ":" + list.size() + "\r\n";
             }
             default -> "-ERR unknown command '" + command.get(0) + "'\r\n";
