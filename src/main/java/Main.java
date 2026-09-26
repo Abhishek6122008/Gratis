@@ -80,8 +80,9 @@ public class Main {
                 yield value == null ? "$-1\r\n" : bulk(value);
             }
             case "RPUSH" -> {
-                lists.put(command.get(1), new ArrayList<>(List.of(command.get(2))));
-                yield ":1\r\n";
+                List<String> list = lists.computeIfAbsent(command.get(1), k -> new ArrayList<>());
+                list.add(command.get(2));
+                yield ":" + list.size() + "\r\n";
             }
             default -> "-ERR unknown command '" + command.get(0) + "'\r\n";
         };
