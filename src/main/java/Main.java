@@ -89,6 +89,7 @@ public class Main {
                 for (String value : command.subList(2, command.size())) list.add(0, value);
                 yield ":" + list.size() + "\r\n";
             }
+            case "LLEN" -> ":" + lists.getOrDefault(command.get(1), List.of()).size() + "\r\n";
             case "LRANGE" -> {
                 List<String> list = lists.getOrDefault(command.get(1), List.of());
                 int start = Math.max(0, index(Integer.parseInt(command.get(2)), list.size()));
