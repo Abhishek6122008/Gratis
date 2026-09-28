@@ -90,6 +90,13 @@ public class Main {
                 yield ":" + list.size() + "\r\n";
             }
             case "LLEN" -> ":" + lists.getOrDefault(command.get(1), List.of()).size() + "\r\n";
+            case "LPOP" -> {
+                List<String> list = lists.get(command.get(1));
+                if (list == null || list.isEmpty()) yield "$-1\r\n";
+                String value = list.remove(0);
+                if (list.isEmpty()) lists.remove(command.get(1));
+                yield bulk(value);
+            }
             case "LRANGE" -> {
                 List<String> list = lists.getOrDefault(command.get(1), List.of());
                 int start = Math.max(0, index(Integer.parseInt(command.get(2)), list.size()));
