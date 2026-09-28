@@ -86,8 +86,8 @@ public class Main {
             }
             case "LRANGE" -> {
                 List<String> list = lists.getOrDefault(command.get(1), List.of());
-                int start = Integer.parseInt(command.get(2));
-                int stop = Math.min(Integer.parseInt(command.get(3)), list.size() - 1);
+                int start = Math.max(0, index(Integer.parseInt(command.get(2)), list.size()));
+                int stop = Math.min(index(Integer.parseInt(command.get(3)), list.size()), list.size() - 1);
                 yield array(start > stop ? List.of() : list.subList(start, stop + 1));
             }
             default -> "-ERR unknown command '" + command.get(0) + "'\r\n";
@@ -105,6 +105,10 @@ public class Main {
 
     static String bulk(String value) {
         return "$" + value.getBytes(StandardCharsets.UTF_8).length + "\r\n" + value + "\r\n";
+    }
+
+    static int index(int value, int size) {
+        return value < 0 ? size + value : value;
     }
 
     static String array(List<String> values) {
