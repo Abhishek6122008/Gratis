@@ -84,6 +84,12 @@ public class Main {
                 list.addAll(command.subList(2, command.size()));
                 yield ":" + list.size() + "\r\n";
             }
+            case "LRANGE" -> {
+                List<String> list = lists.getOrDefault(command.get(1), List.of());
+                int start = Integer.parseInt(command.get(2));
+                int stop = Math.min(Integer.parseInt(command.get(3)), list.size() - 1);
+                yield array(start > stop ? List.of() : list.subList(start, stop + 1));
+            }
             default -> "-ERR unknown command '" + command.get(0) + "'\r\n";
         };
     }
@@ -99,6 +105,12 @@ public class Main {
 
     static String bulk(String value) {
         return "$" + value.getBytes(StandardCharsets.UTF_8).length + "\r\n" + value + "\r\n";
+    }
+
+    static String array(List<String> values) {
+        StringBuilder out = new StringBuilder("*" + values.size() + "\r\n");
+        for (String value : values) out.append(bulk(value));
+        return out.toString();
     }
 
     static List<String> parse(ByteBuffer buffer) {
