@@ -84,6 +84,11 @@ public class Main {
                 list.addAll(command.subList(2, command.size()));
                 yield ":" + list.size() + "\r\n";
             }
+            case "LPUSH" -> {
+                List<String> list = lists.computeIfAbsent(command.get(1), k -> new ArrayList<>());
+                for (String value : command.subList(2, command.size())) list.add(0, value);
+                yield ":" + list.size() + "\r\n";
+            }
             case "LRANGE" -> {
                 List<String> list = lists.getOrDefault(command.get(1), List.of());
                 int start = Math.max(0, index(Integer.parseInt(command.get(2)), list.size()));
