@@ -98,7 +98,7 @@ public class Main {
             case "XADD" -> {
                 List<Entry> stream = streams.getOrDefault(command.get(1), List.of());
                 Entry last = stream.isEmpty() ? null : stream.get(stream.size() - 1);
-                String[] id = command.get(2).split("-");
+                String[] id = command.get(2).equals("*") ? new String[] {String.valueOf(System.currentTimeMillis()), "*"} : command.get(2).split("-");
                 long ms = Long.parseLong(id[0]);
                 long seq = id[1].equals("*") ? nextSeq(last, ms) : Long.parseLong(id[1]);
                 Entry entry = new Entry(ms, seq, List.copyOf(command.subList(3, command.size())));
