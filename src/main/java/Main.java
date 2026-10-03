@@ -96,17 +96,17 @@ public class Main {
             }
             case "TYPE" -> "+" + type(command.get(1)) + "\r\n";
             case "XADD" -> {
+                List<Entry> stream = streams.getOrDefault(command.get(1), List.of());
+                Entry last = stream.isEmpty() ? null : stream.get(stream.size() - 1);
                 String[] id = command.get(2).split("-");
-                Entry entry = new Entry(Long.parseLong(id[0]), Long.parseLong(id[1]), List.copyOf(command.subList(3, command.size())));
-                if (entry.ms() == 0 && entry.seq() == 0) yield "-ERR The ID specified in XADD must be greater than 0-0\r\n";
-                List<Entry> stream = streams.computeIfAbsent(command.get(1), k -> new ArrayList<>());
-                if (!stream.isEmpty()) {
-                    Entry last = stream.get(stream.size() - 1);
-                    if (entry.ms() < last.ms() || (entry.ms() == last.ms() && entry.seq() <= last.seq())) {
-                        yield "-ERR The ID specified in XADD is equal or smaller than the target stream top item\r\n";
-                    }
+                long ms = Long.parseLong(id[0]);
+                long seq = id[1].equals("*") ? nextSeq(last, ms) : Long.parseLong(id[1]);
+                Entry entry = new Entry(ms, seq, List.copyOf(command.subList(3, command.size())));
+                if (ms == 0 && seq == 0) yield "-ERR The ID specified in XADD must be greater than 0-0\r\n";
+                if (last != null && (ms < last.ms() || (ms == last.ms() && seq <= last.seq()))) {
+                    yield "-ERR The ID specified in XADD is equal or smaller than the target stream top item\r\n";
                 }
-                stream.add(entry);
+                streams.computeIfAbsent(command.get(1), k -> new ArrayList<>()).add(entry);
                 yield bulk(entry.id());
             }
             case "RPUSH" -> {
@@ -195,6 +195,11 @@ public class Main {
 
     static void send(SocketChannel client, String response) throws IOException {
         client.write(ByteBuffer.wrap(response.getBytes(StandardCharsets.UTF_8)));
+    }
+
+    static long nextSeq(Entry last, long ms) {
+        if (last != null && last.ms() == ms) return last.seq() + 1;
+        return ms == 0 ? 1 : 0;
     }
 
     static String type(String key) {
