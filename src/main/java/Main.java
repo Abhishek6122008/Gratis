@@ -118,6 +118,15 @@ public class Main {
                 }
                 yield array(result);
             }
+            case "XREAD" -> {
+                String key = command.get(2);
+                long[] after = parseId(command.get(3), 0);
+                List<Object> entries = new ArrayList<>();
+                for (Entry entry : streams.getOrDefault(key, List.of())) {
+                    if (compare(entry, after) > 0) entries.add(List.of(entry.id(), entry.fields()));
+                }
+                yield array(List.of(List.of(key, entries)));
+            }
             case "RPUSH" -> {
                 List<String> list = lists.computeIfAbsent(command.get(1), k -> new ArrayList<>());
                 list.addAll(command.subList(2, command.size()));
