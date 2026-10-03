@@ -3,7 +3,9 @@ import java.nio.ByteBuffer;
 import java.nio.channels.*;
 import java.net.InetSocketAddress;
 import java.nio.charset.StandardCharsets;
+import java.util.ArrayDeque;
 import java.util.ArrayList;
+import java.util.Deque;
 import java.util.HashMap;
 import java.util.Iterator;
 import java.util.List;
@@ -13,6 +15,7 @@ public class Main {
     static final Map<String, String> store = new HashMap<>();
     static final Map<String, Long> expiries = new HashMap<>();
     static final Map<String, List<String>> lists = new HashMap<>();
+    static final Map<String, Deque<SocketChannel>> blocked = new HashMap<>();
 
     public static void main(String[] args) {
         System.out.println("Redis server started on port 6379");
@@ -47,7 +50,8 @@ public class Main {
                         buffer.flip();
                         List<String> command;
                         while ((command = parse(buffer)) != null) {
-                            client.write(ByteBuffer.wrap(handle(command).getBytes(StandardCharsets.UTF_8)));
+                            String response = handle(command, client);
+                            if (response != null) send(client, response);
                         }
                         buffer.compact();
                     }
@@ -58,7 +62,7 @@ public class Main {
         }
     }
 
-    static String handle(List<String> command) {
+    static String handle(List<String> command, SocketChannel client) throws IOException {
         return switch (command.get(0).toUpperCase()) {
             case "PING" -> "+PONG\r\n";
             case "ECHO" -> bulk(command.get(1));
@@ -82,12 +86,16 @@ public class Main {
             case "RPUSH" -> {
                 List<String> list = lists.computeIfAbsent(command.get(1), k -> new ArrayList<>());
                 list.addAll(command.subList(2, command.size()));
-                yield ":" + list.size() + "\r\n";
+                String reply = ":" + list.size() + "\r\n";
+                serve(command.get(1));
+                yield reply;
             }
             case "LPUSH" -> {
                 List<String> list = lists.computeIfAbsent(command.get(1), k -> new ArrayList<>());
                 for (String value : command.subList(2, command.size())) list.add(0, value);
-                yield ":" + list.size() + "\r\n";
+                String reply = ":" + list.size() + "\r\n";
+                serve(command.get(1));
+                yield reply;
             }
             case "LLEN" -> ":" + lists.getOrDefault(command.get(1), List.of()).size() + "\r\n";
             case "LPOP" -> {
@@ -100,6 +108,17 @@ public class Main {
                 if (list.isEmpty()) lists.remove(command.get(1));
                 yield multiple ? array(popped) : bulk(popped.get(0));
             }
+            case "BLPOP" -> {
+                String key = command.get(1);
+                List<String> list = lists.get(key);
+                if (list != null && !list.isEmpty()) {
+                    String value = list.remove(0);
+                    if (list.isEmpty()) lists.remove(key);
+                    yield array(List.of(key, value));
+                }
+                blocked.computeIfAbsent(key, k -> new ArrayDeque<>()).add(client);
+                yield null;
+            }
             case "LRANGE" -> {
                 List<String> list = lists.getOrDefault(command.get(1), List.of());
                 int start = Math.max(0, index(Integer.parseInt(command.get(2)), list.size()));
@@ -108,6 +127,21 @@ public class Main {
             }
             default -> "-ERR unknown command '" + command.get(0) + "'\r\n";
         };
+    }
+
+    static void serve(String key) throws IOException {
+        Deque<SocketChannel> waiting = blocked.getOrDefault(key, new ArrayDeque<>());
+        List<String> list = lists.get(key);
+        while (!waiting.isEmpty() && !list.isEmpty()) {
+            SocketChannel waiter = waiting.poll();
+            if (waiter.isOpen()) send(waiter, array(List.of(key, list.remove(0))));
+        }
+        if (list.isEmpty()) lists.remove(key);
+        if (waiting.isEmpty()) blocked.remove(key);
+    }
+
+    static void send(SocketChannel client, String response) throws IOException {
+        client.write(ByteBuffer.wrap(response.getBytes(StandardCharsets.UTF_8)));
     }
 
     static String get(String key) {
