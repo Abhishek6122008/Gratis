@@ -109,6 +109,15 @@ public class Main {
                 streams.computeIfAbsent(command.get(1), k -> new ArrayList<>()).add(entry);
                 yield bulk(entry.id());
             }
+            case "XRANGE" -> {
+                long[] start = parseId(command.get(2), 0);
+                long[] end = parseId(command.get(3), Long.MAX_VALUE);
+                List<Object> result = new ArrayList<>();
+                for (Entry entry : streams.getOrDefault(command.get(1), List.of())) {
+                    if (compare(entry, start) >= 0 && compare(entry, end) <= 0) result.add(List.of(entry.id(), entry.fields()));
+                }
+                yield array(result);
+            }
             case "RPUSH" -> {
                 List<String> list = lists.computeIfAbsent(command.get(1), k -> new ArrayList<>());
                 list.addAll(command.subList(2, command.size()));
@@ -197,6 +206,15 @@ public class Main {
         client.write(ByteBuffer.wrap(response.getBytes(StandardCharsets.UTF_8)));
     }
 
+    static long[] parseId(String id, long defaultSeq) {
+        String[] parts = id.split("-");
+        return new long[] {Long.parseLong(parts[0]), parts.length > 1 ? Long.parseLong(parts[1]) : defaultSeq};
+    }
+
+    static int compare(Entry entry, long[] id) {
+        return entry.ms() != id[0] ? Long.compare(entry.ms(), id[0]) : Long.compare(entry.seq(), id[1]);
+    }
+
     static long nextSeq(Entry last, long ms) {
         if (last != null && last.ms() == ms) return last.seq() + 1;
         return ms == 0 ? 1 : 0;
@@ -226,9 +244,9 @@ public class Main {
         return value < 0 ? size + value : value;
     }
 
-    static String array(List<String> values) {
+    static String array(List<?> values) {
         StringBuilder out = new StringBuilder("*" + values.size() + "\r\n");
-        for (String value : values) out.append(bulk(value));
+        for (Object value : values) out.append(value instanceof List<?> list ? array(list) : bulk((String) value));
         return out.toString();
     }
 
