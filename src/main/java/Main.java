@@ -98,7 +98,15 @@ public class Main {
             case "XADD" -> {
                 String[] id = command.get(2).split("-");
                 Entry entry = new Entry(Long.parseLong(id[0]), Long.parseLong(id[1]), List.copyOf(command.subList(3, command.size())));
-                streams.computeIfAbsent(command.get(1), k -> new ArrayList<>()).add(entry);
+                if (entry.ms() == 0 && entry.seq() == 0) yield "-ERR The ID specified in XADD must be greater than 0-0\r\n";
+                List<Entry> stream = streams.computeIfAbsent(command.get(1), k -> new ArrayList<>());
+                if (!stream.isEmpty()) {
+                    Entry last = stream.get(stream.size() - 1);
+                    if (entry.ms() < last.ms() || (entry.ms() == last.ms() && entry.seq() <= last.seq())) {
+                        yield "-ERR The ID specified in XADD is equal or smaller than the target stream top item\r\n";
+                    }
+                }
+                stream.add(entry);
                 yield bulk(entry.id());
             }
             case "RPUSH" -> {
