@@ -15,7 +15,9 @@ public class Main {
     static final Map<String, String> store = new HashMap<>();
     static final Map<String, Long> expiries = new HashMap<>();
     static final Map<String, List<String>> lists = new HashMap<>();
-    static final Map<String, Deque<SocketChannel>> blocked = new HashMap<>();
+    static final Map<String, Deque<Waiter>> blocked = new HashMap<>();
+
+    record Waiter(SocketChannel client, long deadline) {}
 
     public static void main(String[] args) {
         System.out.println("Redis server started on port 6379");
@@ -26,7 +28,7 @@ public class Main {
             serverChannel.configureBlocking(false);
             serverChannel.register(selector, SelectionKey.OP_ACCEPT);
             while (true) {
-                selector.select();
+                selector.select(nextTimeout());
                 Iterator<SelectionKey> keys = selector.selectedKeys().iterator();
                 while (keys.hasNext()) {
                     SelectionKey key = keys.next();
@@ -56,6 +58,7 @@ public class Main {
                         buffer.compact();
                     }
                 }
+                expire();
             }
         } catch (IOException e) {
             e.printStackTrace();
@@ -116,7 +119,9 @@ public class Main {
                     if (list.isEmpty()) lists.remove(key);
                     yield array(List.of(key, value));
                 }
-                blocked.computeIfAbsent(key, k -> new ArrayDeque<>()).add(client);
+                double seconds = Double.parseDouble(command.get(2));
+                long deadline = seconds == 0 ? Long.MAX_VALUE : System.currentTimeMillis() + (long) (seconds * 1000);
+                blocked.computeIfAbsent(key, k -> new ArrayDeque<>()).add(new Waiter(client, deadline));
                 yield null;
             }
             case "LRANGE" -> {
@@ -130,14 +135,39 @@ public class Main {
     }
 
     static void serve(String key) throws IOException {
-        Deque<SocketChannel> waiting = blocked.getOrDefault(key, new ArrayDeque<>());
+        Deque<Waiter> waiting = blocked.getOrDefault(key, new ArrayDeque<>());
         List<String> list = lists.get(key);
         while (!waiting.isEmpty() && !list.isEmpty()) {
-            SocketChannel waiter = waiting.poll();
+            SocketChannel waiter = waiting.poll().client();
             if (waiter.isOpen()) send(waiter, array(List.of(key, list.remove(0))));
         }
         if (list.isEmpty()) lists.remove(key);
         if (waiting.isEmpty()) blocked.remove(key);
+    }
+
+    static long nextTimeout() {
+        long next = Long.MAX_VALUE;
+        for (Deque<Waiter> waiting : blocked.values()) {
+            for (Waiter waiter : waiting) next = Math.min(next, waiter.deadline());
+        }
+        return next == Long.MAX_VALUE ? 0 : Math.max(1, next - System.currentTimeMillis());
+    }
+
+    static void expire() throws IOException {
+        long now = System.currentTimeMillis();
+        Iterator<Deque<Waiter>> queues = blocked.values().iterator();
+        while (queues.hasNext()) {
+            Deque<Waiter> waiting = queues.next();
+            Iterator<Waiter> waiters = waiting.iterator();
+            while (waiters.hasNext()) {
+                Waiter waiter = waiters.next();
+                if (now >= waiter.deadline()) {
+                    waiters.remove();
+                    if (waiter.client().isOpen()) send(waiter.client(), "*-1\r\n");
+                }
+            }
+            if (waiting.isEmpty()) queues.remove();
+        }
     }
 
     static void send(SocketChannel client, String response) throws IOException {
