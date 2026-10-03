@@ -86,6 +86,7 @@ public class Main {
                 String value = get(command.get(1));
                 yield value == null ? "$-1\r\n" : bulk(value);
             }
+            case "TYPE" -> "+" + type(command.get(1)) + "\r\n";
             case "RPUSH" -> {
                 List<String> list = lists.computeIfAbsent(command.get(1), k -> new ArrayList<>());
                 list.addAll(command.subList(2, command.size()));
@@ -172,6 +173,12 @@ public class Main {
 
     static void send(SocketChannel client, String response) throws IOException {
         client.write(ByteBuffer.wrap(response.getBytes(StandardCharsets.UTF_8)));
+    }
+
+    static String type(String key) {
+        if (get(key) != null) return "string";
+        if (lists.containsKey(key)) return "list";
+        return "none";
     }
 
     static String get(String key) {
