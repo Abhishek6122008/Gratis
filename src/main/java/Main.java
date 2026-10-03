@@ -17,7 +17,15 @@ public class Main {
     static final Map<String, List<String>> lists = new HashMap<>();
     static final Map<String, Deque<Waiter>> blocked = new HashMap<>();
 
+    static final Map<String, List<Entry>> streams = new HashMap<>();
+
     record Waiter(SocketChannel client, long deadline) {}
+
+    record Entry(long ms, long seq, List<String> fields) {
+        String id() {
+            return ms + "-" + seq;
+        }
+    }
 
     public static void main(String[] args) {
         System.out.println("Redis server started on port 6379");
@@ -87,6 +95,12 @@ public class Main {
                 yield value == null ? "$-1\r\n" : bulk(value);
             }
             case "TYPE" -> "+" + type(command.get(1)) + "\r\n";
+            case "XADD" -> {
+                String[] id = command.get(2).split("-");
+                Entry entry = new Entry(Long.parseLong(id[0]), Long.parseLong(id[1]), List.copyOf(command.subList(3, command.size())));
+                streams.computeIfAbsent(command.get(1), k -> new ArrayList<>()).add(entry);
+                yield bulk(entry.id());
+            }
             case "RPUSH" -> {
                 List<String> list = lists.computeIfAbsent(command.get(1), k -> new ArrayList<>());
                 list.addAll(command.subList(2, command.size()));
@@ -178,6 +192,7 @@ public class Main {
     static String type(String key) {
         if (get(key) != null) return "string";
         if (lists.containsKey(key)) return "list";
+        if (streams.containsKey(key)) return "stream";
         return "none";
     }
 
