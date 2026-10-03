@@ -92,10 +92,13 @@ public class Main {
             case "LLEN" -> ":" + lists.getOrDefault(command.get(1), List.of()).size() + "\r\n";
             case "LPOP" -> {
                 List<String> list = lists.get(command.get(1));
-                if (list == null || list.isEmpty()) yield "$-1\r\n";
-                String value = list.remove(0);
+                boolean multiple = command.size() > 2;
+                if (list == null || list.isEmpty()) yield multiple ? "*-1\r\n" : "$-1\r\n";
+                int count = multiple ? Math.min(Integer.parseInt(command.get(2)), list.size()) : 1;
+                List<String> popped = new ArrayList<>(list.subList(0, count));
+                list.subList(0, count).clear();
                 if (list.isEmpty()) lists.remove(command.get(1));
-                yield bulk(value);
+                yield multiple ? array(popped) : bulk(popped.get(0));
             }
             case "LRANGE" -> {
                 List<String> list = lists.getOrDefault(command.get(1), List.of());
