@@ -208,6 +208,7 @@ public class Main {
 
     static long[] parseId(String id, long defaultSeq) {
         if (id.equals("-")) return new long[] {0, 0};
+        if (id.equals("+")) return new long[] {Long.MAX_VALUE, Long.MAX_VALUE};
         String[] parts = id.split("-");
         return new long[] {Long.parseLong(parts[0]), parts.length > 1 ? Long.parseLong(parts[1]) : defaultSeq};
     }
