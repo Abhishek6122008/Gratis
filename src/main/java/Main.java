@@ -132,7 +132,10 @@ public class Main {
                 int n = (command.size() - s - 1) / 2;
                 List<String> keys = command.subList(s + 1, s + 1 + n);
                 List<long[]> after = new ArrayList<>();
-                for (int i = 0; i < n; i++) after.add(parseId(command.get(s + 1 + n + i), 0));
+                for (int i = 0; i < n; i++) {
+                    String id = command.get(s + 1 + n + i);
+                    after.add(id.equals("$") ? lastId(keys.get(i)) : parseId(id, 0));
+                }
                 List<Object> result = xread(keys, after);
                 if (!result.isEmpty()) yield array(result);
                 if (block < 0) yield "*-1\r\n";
@@ -266,6 +269,13 @@ public class Main {
         if (id.equals("+")) return new long[] {Long.MAX_VALUE, Long.MAX_VALUE};
         String[] parts = id.split("-");
         return new long[] {Long.parseLong(parts[0]), parts.length > 1 ? Long.parseLong(parts[1]) : defaultSeq};
+    }
+
+    static long[] lastId(String key) {
+        List<Entry> stream = streams.getOrDefault(key, List.of());
+        if (stream.isEmpty()) return new long[] {0, 0};
+        Entry last = stream.get(stream.size() - 1);
+        return new long[] {last.ms(), last.seq()};
     }
 
     static int compare(Entry entry, long[] id) {
