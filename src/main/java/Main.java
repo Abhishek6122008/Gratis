@@ -97,6 +97,11 @@ public class Main {
                 String value = get(command.get(1));
                 yield value == null ? "$-1\r\n" : bulk(value);
             }
+            case "INCR" -> {
+                long value = Long.parseLong(get(command.get(1))) + 1;
+                store.put(command.get(1), String.valueOf(value));
+                yield ":" + value + "\r\n";
+            }
             case "TYPE" -> "+" + type(command.get(1)) + "\r\n";
             case "XADD" -> {
                 List<Entry> stream = streams.getOrDefault(command.get(1), List.of());
