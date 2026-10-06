@@ -136,7 +136,8 @@ public class Main {
                 List<Object> result = xread(keys, after);
                 if (!result.isEmpty()) yield array(result);
                 if (block < 0) yield "*-1\r\n";
-                readers.add(new Reader(client, List.copyOf(keys), after, System.currentTimeMillis() + block));
+                long deadline = block == 0 ? Long.MAX_VALUE : System.currentTimeMillis() + block;
+                readers.add(new Reader(client, List.copyOf(keys), after, deadline));
                 yield null;
             }
             case "RPUSH" -> {
