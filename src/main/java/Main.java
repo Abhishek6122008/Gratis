@@ -98,7 +98,8 @@ public class Main {
                 yield value == null ? "$-1\r\n" : bulk(value);
             }
             case "INCR" -> {
-                long value = Long.parseLong(get(command.get(1))) + 1;
+                String current = get(command.get(1));
+                long value = (current == null ? 0 : Long.parseLong(current)) + 1;
                 store.put(command.get(1), String.valueOf(value));
                 yield ":" + value + "\r\n";
             }
