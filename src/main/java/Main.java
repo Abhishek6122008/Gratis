@@ -18,8 +18,11 @@ public class Main {
     static final Map<String, Deque<Waiter>> blocked = new HashMap<>();
 
     static final Map<String, List<Entry>> streams = new HashMap<>();
+    static final List<Reader> readers = new ArrayList<>();
 
     record Waiter(SocketChannel client, long deadline) {}
+
+    record Reader(SocketChannel client, List<String> keys, List<long[]> after, long deadline) {}
 
     record Entry(long ms, long seq, List<String> fields) {
         String id() {
@@ -107,6 +110,7 @@ public class Main {
                     yield "-ERR The ID specified in XADD is equal or smaller than the target stream top item\r\n";
                 }
                 streams.computeIfAbsent(command.get(1), k -> new ArrayList<>()).add(entry);
+                wake(command.get(1));
                 yield bulk(entry.id());
             }
             case "XRANGE" -> {
@@ -120,13 +124,20 @@ public class Main {
             }
             case "XREAD" -> {
                 int s = 1;
-                while (!command.get(s).equalsIgnoreCase("STREAMS")) s++;
+                long block = -1;
+                while (!command.get(s).equalsIgnoreCase("STREAMS")) {
+                    if (command.get(s).equalsIgnoreCase("BLOCK")) block = Long.parseLong(command.get(s + 1));
+                    s++;
+                }
                 int n = (command.size() - s - 1) / 2;
                 List<String> keys = command.subList(s + 1, s + 1 + n);
                 List<long[]> after = new ArrayList<>();
                 for (int i = 0; i < n; i++) after.add(parseId(command.get(s + 1 + n + i), 0));
                 List<Object> result = xread(keys, after);
-                yield result.isEmpty() ? "*-1\r\n" : array(result);
+                if (!result.isEmpty()) yield array(result);
+                if (block < 0) yield "*-1\r\n";
+                readers.add(new Reader(client, List.copyOf(keys), after, System.currentTimeMillis() + block));
+                yield null;
             }
             case "RPUSH" -> {
                 List<String> list = lists.computeIfAbsent(command.get(1), k -> new ArrayList<>());
@@ -188,6 +199,18 @@ public class Main {
         return result;
     }
 
+    static void wake(String key) throws IOException {
+        Iterator<Reader> it = readers.iterator();
+        while (it.hasNext()) {
+            Reader reader = it.next();
+            if (!reader.keys().contains(key)) continue;
+            List<Object> result = xread(reader.keys(), reader.after());
+            if (result.isEmpty()) continue;
+            it.remove();
+            if (reader.client().isOpen()) send(reader.client(), array(result));
+        }
+    }
+
     static void serve(String key) throws IOException {
         Deque<Waiter> waiting = blocked.getOrDefault(key, new ArrayDeque<>());
         List<String> list = lists.get(key);
@@ -204,6 +227,7 @@ public class Main {
         for (Deque<Waiter> waiting : blocked.values()) {
             for (Waiter waiter : waiting) next = Math.min(next, waiter.deadline());
         }
+        for (Reader reader : readers) next = Math.min(next, reader.deadline());
         return next == Long.MAX_VALUE ? 0 : Math.max(1, next - System.currentTimeMillis());
     }
 
@@ -221,6 +245,14 @@ public class Main {
                 }
             }
             if (waiting.isEmpty()) queues.remove();
+        }
+        Iterator<Reader> it = readers.iterator();
+        while (it.hasNext()) {
+            Reader reader = it.next();
+            if (now >= reader.deadline()) {
+                it.remove();
+                if (reader.client().isOpen()) send(reader.client(), "*-1\r\n");
+            }
         }
     }
 
