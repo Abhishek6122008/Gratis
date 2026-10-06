@@ -119,13 +119,14 @@ public class Main {
                 yield array(result);
             }
             case "XREAD" -> {
-                String key = command.get(2);
-                long[] after = parseId(command.get(3), 0);
-                List<Object> entries = new ArrayList<>();
-                for (Entry entry : streams.getOrDefault(key, List.of())) {
-                    if (compare(entry, after) > 0) entries.add(List.of(entry.id(), entry.fields()));
-                }
-                yield array(List.of(List.of(key, entries)));
+                int s = 1;
+                while (!command.get(s).equalsIgnoreCase("STREAMS")) s++;
+                int n = (command.size() - s - 1) / 2;
+                List<String> keys = command.subList(s + 1, s + 1 + n);
+                List<long[]> after = new ArrayList<>();
+                for (int i = 0; i < n; i++) after.add(parseId(command.get(s + 1 + n + i), 0));
+                List<Object> result = xread(keys, after);
+                yield result.isEmpty() ? "*-1\r\n" : array(result);
             }
             case "RPUSH" -> {
                 List<String> list = lists.computeIfAbsent(command.get(1), k -> new ArrayList<>());
@@ -173,6 +174,18 @@ public class Main {
             }
             default -> "-ERR unknown command '" + command.get(0) + "'\r\n";
         };
+    }
+
+    static List<Object> xread(List<String> keys, List<long[]> after) {
+        List<Object> result = new ArrayList<>();
+        for (int i = 0; i < keys.size(); i++) {
+            List<Object> entries = new ArrayList<>();
+            for (Entry entry : streams.getOrDefault(keys.get(i), List.of())) {
+                if (compare(entry, after.get(i)) > 0) entries.add(List.of(entry.id(), entry.fields()));
+            }
+            if (!entries.isEmpty()) result.add(List.of(keys.get(i), entries));
+        }
+        return result;
     }
 
     static void serve(String key) throws IOException {
