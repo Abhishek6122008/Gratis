@@ -19,6 +19,7 @@ public class Main {
 
     static final Map<String, List<Entry>> streams = new HashMap<>();
     static final List<Reader> readers = new ArrayList<>();
+    static final Map<SocketChannel, List<List<String>>> transactions = new HashMap<>();
 
     record Waiter(SocketChannel client, long deadline) {}
 
@@ -107,6 +108,10 @@ public class Main {
                 }
                 store.put(command.get(1), String.valueOf(value));
                 yield ":" + value + "\r\n";
+            }
+            case "MULTI" -> {
+                transactions.put(client, new ArrayList<>());
+                yield "+OK\r\n";
             }
             case "TYPE" -> "+" + type(command.get(1)) + "\r\n";
             case "XADD" -> {
