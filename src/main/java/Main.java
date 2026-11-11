@@ -99,7 +99,12 @@ public class Main {
             }
             case "INCR" -> {
                 String current = get(command.get(1));
-                long value = (current == null ? 0 : Long.parseLong(current)) + 1;
+                long value;
+                try {
+                    value = Math.addExact(current == null ? 0 : Long.parseLong(current), 1);
+                } catch (NumberFormatException | ArithmeticException e) {
+                    yield "-ERR value is not an integer or out of range\r\n";
+                }
                 store.put(command.get(1), String.valueOf(value));
                 yield ":" + value + "\r\n";
             }
