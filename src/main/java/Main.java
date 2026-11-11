@@ -80,7 +80,7 @@ public class Main {
     static String handle(List<String> command, SocketChannel client) throws IOException {
         String name = command.get(0).toUpperCase();
         List<List<String>> queue = transactions.get(client);
-        if (queue != null && !name.equals("EXEC")) {
+        if (queue != null && !name.equals("EXEC") && !name.equals("DISCARD")) {
             queue.add(command);
             return "+QUEUED\r\n";
         }
@@ -128,6 +128,7 @@ public class Main {
                 }
                 yield out.toString();
             }
+            case "DISCARD" -> transactions.remove(client) == null ? "-ERR DISCARD without MULTI\r\n" : "+OK\r\n";
             case "TYPE" -> "+" + type(command.get(1)) + "\r\n";
             case "XADD" -> {
                 List<Entry> stream = streams.getOrDefault(command.get(1), List.of());
