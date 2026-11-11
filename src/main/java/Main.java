@@ -58,6 +58,7 @@ public class Main {
                         if (client.read(buffer) == -1) {
                             client.close();
                             key.cancel();
+                            transactions.remove(client);
                             System.out.println("Client disconnected!");
                             continue;
                         }
