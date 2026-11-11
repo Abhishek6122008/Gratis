@@ -113,6 +113,11 @@ public class Main {
                 transactions.put(client, new ArrayList<>());
                 yield "+OK\r\n";
             }
+            case "EXEC" -> {
+                List<List<String>> queued = transactions.remove(client);
+                if (queued == null) yield "-ERR EXEC without MULTI\r\n";
+                yield "*0\r\n";
+            }
             case "TYPE" -> "+" + type(command.get(1)) + "\r\n";
             case "XADD" -> {
                 List<Entry> stream = streams.getOrDefault(command.get(1), List.of());
