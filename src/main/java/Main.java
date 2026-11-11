@@ -81,7 +81,7 @@ public class Main {
     static String handle(List<String> command, SocketChannel client) throws IOException {
         String name = command.get(0).toUpperCase();
         List<List<String>> queue = transactions.get(client);
-        if (queue != null && !name.equals("EXEC") && !name.equals("DISCARD")) {
+        if (queue != null && !name.equals("MULTI") && !name.equals("EXEC") && !name.equals("DISCARD")) {
             queue.add(command);
             return "+QUEUED\r\n";
         }
@@ -117,6 +117,7 @@ public class Main {
                 yield ":" + value + "\r\n";
             }
             case "MULTI" -> {
+                if (queue != null) yield "-ERR MULTI calls can not be nested\r\n";
                 transactions.put(client, new ArrayList<>());
                 yield "+OK\r\n";
             }
