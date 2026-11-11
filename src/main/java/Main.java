@@ -20,6 +20,7 @@ public class Main {
     static final Map<String, List<Entry>> streams = new HashMap<>();
     static final List<Reader> readers = new ArrayList<>();
     static final Map<SocketChannel, List<List<String>>> transactions = new HashMap<>();
+    static boolean executing;
 
     record Waiter(SocketChannel client, long deadline) {}
 
@@ -125,6 +126,7 @@ public class Main {
                 List<List<String>> queued = transactions.remove(client);
                 if (queued == null) yield "-ERR EXEC without MULTI\r\n";
                 StringBuilder out = new StringBuilder("*" + queued.size() + "\r\n");
+                executing = true;
                 for (List<String> queuedCommand : queued) {
                     try {
                         out.append(handle(queuedCommand, client));
@@ -132,6 +134,7 @@ public class Main {
                         out.append("-ERR ").append(e.getMessage()).append("\r\n");
                     }
                 }
+                executing = false;
                 yield out.toString();
             }
             case "DISCARD" -> transactions.remove(client) == null ? "-ERR DISCARD without MULTI\r\n" : "+OK\r\n";
@@ -176,7 +179,7 @@ public class Main {
                 }
                 List<Object> result = xread(keys, after);
                 if (!result.isEmpty()) yield array(result);
-                if (block < 0) yield "*-1\r\n";
+                if (block < 0 || executing) yield "*-1\r\n";
                 long deadline = block == 0 ? Long.MAX_VALUE : System.currentTimeMillis() + block;
                 readers.add(new Reader(client, List.copyOf(keys), after, deadline));
                 yield null;
@@ -214,6 +217,7 @@ public class Main {
                     if (list.isEmpty()) lists.remove(key);
                     yield array(List.of(key, value));
                 }
+                if (executing) yield "*-1\r\n";
                 double seconds = Double.parseDouble(command.get(2));
                 long deadline = seconds == 0 ? Long.MAX_VALUE : System.currentTimeMillis() + (long) (seconds * 1000);
                 blocked.computeIfAbsent(key, k -> new ArrayDeque<>()).add(new Waiter(client, deadline));
