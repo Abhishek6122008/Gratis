@@ -124,7 +124,11 @@ public class Main {
                 if (queued == null) yield "-ERR EXEC without MULTI\r\n";
                 StringBuilder out = new StringBuilder("*" + queued.size() + "\r\n");
                 for (List<String> queuedCommand : queued) {
-                    out.append(handle(queuedCommand, client));
+                    try {
+                        out.append(handle(queuedCommand, client));
+                    } catch (RuntimeException e) {
+                        out.append("-ERR ").append(e.getMessage()).append("\r\n");
+                    }
                 }
                 yield out.toString();
             }
