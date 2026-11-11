@@ -122,7 +122,11 @@ public class Main {
             case "EXEC" -> {
                 List<List<String>> queued = transactions.remove(client);
                 if (queued == null) yield "-ERR EXEC without MULTI\r\n";
-                yield "*0\r\n";
+                StringBuilder out = new StringBuilder("*" + queued.size() + "\r\n");
+                for (List<String> queuedCommand : queued) {
+                    out.append(handle(queuedCommand, client));
+                }
+                yield out.toString();
             }
             case "TYPE" -> "+" + type(command.get(1)) + "\r\n";
             case "XADD" -> {
