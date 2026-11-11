@@ -78,7 +78,13 @@ public class Main {
     }
 
     static String handle(List<String> command, SocketChannel client) throws IOException {
-        return switch (command.get(0).toUpperCase()) {
+        String name = command.get(0).toUpperCase();
+        List<List<String>> queue = transactions.get(client);
+        if (queue != null && !name.equals("EXEC")) {
+            queue.add(command);
+            return "+QUEUED\r\n";
+        }
+        return switch (name) {
             case "PING" -> "+PONG\r\n";
             case "ECHO" -> bulk(command.get(1));
             case "SET" -> {
