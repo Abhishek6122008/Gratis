@@ -7,9 +7,10 @@ bench/run.sh gratis@39f0113 gratis@v2 redis valkey      # about 20 minutes per t
 .venv/bin/python bench/report.py bench/results/<run>    # report.md + charts in that directory (needs matplotlib)
 ```
 
-- **Targets.** `gratis@REF` builds an image from that ref's sources with `build-image.sh` (a git worktree, JDK 25,
-  `-Xms1g -Xmx1g`). `redis` and `valkey` are pinned by digest in `run.sh`, with persistence off (`--save ""
-  --appendonly no`), because Gratis has none.
+- **Targets.** `gratis@REF` builds an image from that ref's sources with `build-image.sh` (a git worktree, JDK 25
+  pinned by digest, `-Xms1g -Xmx1g`). Options after a comma: `shards=N` starts it with `--shards N`, and `zgc` uses
+  generational ZGC instead of G1, as in `gratis@v2,shards=4,zgc`. `redis` and `valkey` are pinned by digest in
+  `run.sh`, with persistence off (`--save "" --appendonly no`), because Gratis has none.
 - **Same limits for everyone.** The server gets CPUs `2,3,6,7` (two physical cores on the i5-10300H) and 4 GB.
   memtier gets `0,1,4,5`. Both are containers on one Docker bridge network, so the network path is the same too.
 - **Workload.** 100,000 keys, 100-byte values, SET:GET 1:10, uniform random keys. Before measuring, every key is

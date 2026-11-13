@@ -25,7 +25,7 @@ def load(results):
     """{target: {(pipeline, connections): [run dicts]}}, targets in the order they ran."""
     # Targets in the order run.sh started them (its "<target> image:" lines in meta.txt), then any others by name.
     meta = results / "meta.txt"
-    order = [line.split(" image:")[0].replace("@", "-") for line in meta.read_text().splitlines()
+    order = [re.sub(r"[@,=]", "-", line.split(" image:")[0]) for line in meta.read_text().splitlines()
              if " image:" in line] if meta.exists() else []
     dirs = sorted((d for d in results.iterdir() if d.is_dir()),
                   key=lambda d: (order.index(d.name) if d.name in order else len(order), d.name))
