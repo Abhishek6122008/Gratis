@@ -36,3 +36,22 @@ around each command, the other moves the read into its own method. Every later s
 - This is a laptop: the CPU governor is `powersave` with turbo on, and nothing else is stopped during a run. The
   5-run spread is there to show how much that matters.
 - Client and server share one machine, so the client's CPU use can limit the result at high connection counts.
+
+## Profiling
+
+```sh
+PYTHON=.venv/bin/python bench/profile.sh 39f0113 16 64    # ref, pipeline depth, connections
+```
+
+Runs one target under one memtier load (fill and warm-up first, then 30 s recorded) and records it with JDK Flight
+Recorder. Recording uses JDK 25's CPU-time sampler (`jdk.CPUTimeSample`, 1 ms) plus allocation samples and GC
+pauses. Output in `bench/results/profile-<sha>-p<P>-c<C>/`: `profile.jfr`, CPU and allocation flame graphs
+(`flame-*.svg`, drawn by `flamegraph.py`, with their top frames in `flame-*.txt`), and the JDK's own `jfr view`
+summaries (`view-*.txt`).
+
+- The recording costs a lot of throughput (218k against 513k ops/s at pipeline 16 and 64 connections, Day 3), so a
+  profile shows *where* the time goes, not how fast the code is. The numbers come from `run.sh`.
+- Allocation samples are weighted by the bytes allocated since the previous sample, so a few large allocations right
+  after the recording starts (each connection's 64 KB buffer) come out far heavier than they are.
+- async-profiler would also show native and kernel frames. JFR stops at the Java frame that makes the system call
+  (`SocketDispatcher.write0`), which is enough to see the cost of each call.
