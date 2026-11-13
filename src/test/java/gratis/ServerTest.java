@@ -34,6 +34,10 @@ abstract class ServerTest {
         return client;
     }
 
+    int port() {
+        return server.port;
+    }
+
     static String bulk(String value) {
         return "$" + value.length() + "\r\n" + value + "\r\n";
     }

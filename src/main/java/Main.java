@@ -70,7 +70,7 @@ public class Main {
                         buffer.flip();
                         List<String> command;
                         while ((command = parse(buffer)) != null) {
-                            String response = handle(command, client);
+                            String response = run(command, client);
                             if (response != null) send(client, response);
                         }
                         buffer.compact();
@@ -80,6 +80,19 @@ public class Main {
             }
         } catch (IOException e) {
             e.printStackTrace();
+        }
+    }
+
+    // A command that throws gets an error reply, the way Redis answers bad arguments, instead of ending the loop.
+    static String run(List<String> command, SocketChannel client) throws IOException {
+        try {
+            return handle(command, client);
+        } catch (IndexOutOfBoundsException e) {
+            return "-ERR wrong number of arguments for '" + command.get(0).toLowerCase() + "' command\r\n";
+        } catch (NumberFormatException e) {
+            return "-ERR value is not an integer or out of range\r\n";
+        } catch (RuntimeException e) {
+            return "-ERR " + e.getMessage() + "\r\n";
         }
     }
 
@@ -131,13 +144,7 @@ public class Main {
                 if (queued == null) yield "-ERR EXEC without MULTI\r\n";
                 StringBuilder out = new StringBuilder("*" + queued.size() + "\r\n");
                 executing = true;
-                for (List<String> queuedCommand : queued) {
-                    try {
-                        out.append(handle(queuedCommand, client));
-                    } catch (RuntimeException e) {
-                        out.append("-ERR ").append(e.getMessage()).append("\r\n");
-                    }
-                }
+                for (List<String> queuedCommand : queued) out.append(run(queuedCommand, client));
                 executing = false;
                 yield out.toString();
             }
