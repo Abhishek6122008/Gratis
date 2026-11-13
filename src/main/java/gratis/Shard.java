@@ -65,8 +65,11 @@ final class Shard implements Runnable {
     private final AtomicReference<Connection> inbox = new AtomicReference<>();
     // New clients from the accepting shard.
     private final ConcurrentLinkedQueue<Runnable> tasks = new ConcurrentLinkedQueue<>();
-    // Shards this pass handed work to, woken once at the end of the pass.
+    // Shards this pass handed work to while they slept, woken once at the end of the pass.
     private boolean[] wake;
+    // True while this shard is (about to be) asleep in select(). Under load shards are rarely asleep, so most hand-offs
+    // cost no wakeup system call.
+    private volatile boolean sleeping;
     // Arguments of the run being executed here for another shard's client.
     private final Args remote = new Args();
     private int nextShard;
@@ -99,7 +102,12 @@ final class Shard implements Runnable {
         try {
             while (true) {
                 if (retry.isEmpty()) {
-                    selector.select(this::ready, nextTimeout());
+                    // Announce the sleep, then look once more: a shard that pushed before seeing `sleeping` left its
+                    // work in the inbox, and one that pushed after will wake us (both are volatile, so one must hold).
+                    sleeping = true;
+                    if (inbox.get() == null && tasks.isEmpty()) selector.select(this::ready, nextTimeout());
+                    else selector.selectNow(this::ready);
+                    sleeping = false;
                 } else {
                     selector.selectNow(this::ready);
                     for (Connection c : retry) {
@@ -361,17 +369,17 @@ final class Shard implements Runnable {
     private void send(Connection c, int owner) {
         c.waiting = true;
         c.reply.buf.clear();
-        if (all[owner].push(c)) wake[owner] = true;
+        handOver(c, all[owner]);
     }
 
-    // Returns true if the inbox was empty, so the caller must wake this shard; otherwise someone already will.
-    private boolean push(Connection c) {
+    // Puts a client in another shard's inbox, and wakes that shard at the end of this pass if it is asleep.
+    private void handOver(Connection c, Shard to) {
         Connection head;
         do {
-            head = inbox.get();
+            head = to.inbox.get();
             c.next = head;
-        } while (!inbox.compareAndSet(head, c));
-        return head == null;
+        } while (!to.inbox.compareAndSet(head, c));
+        if (to.sleeping) wake[to.id] = true;
     }
 
     private void drainInbox() {
@@ -423,7 +431,7 @@ final class Shard implements Runnable {
 
     private void sendHome(Connection c) {
         if (c.home == this) complete(c);
-        else if (c.home.push(c)) wake[c.home.id] = true;
+        else handOver(c, c.home);
     }
 
     // One of this shard's clients is back from a run: its replies go out after the ones before them, and its next
