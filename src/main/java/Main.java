@@ -53,27 +53,18 @@ public class Main {
                     if (key.isAcceptable()) {
                         ServerSocketChannel server = (ServerSocketChannel) key.channel();
                         SocketChannel client = server.accept();
+                        if (client == null) continue;
                         client.configureBlocking(false);
                         client.register(selector, SelectionKey.OP_READ, ByteBuffer.allocate(64 * 1024));
                         System.out.println("Client connected!");
                     }
                     if (key.isValid() && key.isReadable()) {
                         SocketChannel client = (SocketChannel) key.channel();
-                        ByteBuffer buffer = (ByteBuffer) key.attachment();
-                        if (client.read(buffer) == -1) {
-                            client.close();
-                            key.cancel();
-                            transactions.remove(client);
-                            System.out.println("Client disconnected!");
-                            continue;
+                        try {
+                            read(client, (ByteBuffer) key.attachment());
+                        } catch (IOException e) {
+                            disconnect(client);
                         }
-                        buffer.flip();
-                        List<String> command;
-                        while ((command = parse(buffer)) != null) {
-                            String response = run(command, client);
-                            if (response != null) send(client, response);
-                        }
-                        buffer.compact();
                     }
                 }
                 expire();
@@ -81,6 +72,31 @@ public class Main {
         } catch (IOException e) {
             e.printStackTrace();
         }
+    }
+
+    // One client's failed read must not stop the server for everyone else, so its IOException ends only that client.
+    static void read(SocketChannel client, ByteBuffer buffer) throws IOException {
+        if (client.read(buffer) == -1) {
+            disconnect(client);
+            return;
+        }
+        buffer.flip();
+        List<String> command;
+        while ((command = parse(buffer)) != null) {
+            String response = run(command, client);
+            if (response != null) send(client, response);
+        }
+        buffer.compact();
+    }
+
+    static void disconnect(SocketChannel client) {
+        try {
+            client.close();
+        } catch (IOException ignored) {
+            // closing anyway
+        }
+        transactions.remove(client);
+        System.out.println("Client disconnected!");
     }
 
     // A command that throws gets an error reply, the way Redis answers bad arguments, instead of ending the loop.
@@ -273,7 +289,7 @@ public class Main {
         List<String> list = lists.get(key);
         while (!waiting.isEmpty() && !list.isEmpty()) {
             SocketChannel waiter = waiting.poll().client();
-            if (waiter.isOpen()) send(waiter, array(List.of(key, list.remove(0))));
+            if (waiter.isOpen() && send(waiter, array(List.of(key, list.get(0))))) list.remove(0);
         }
         if (list.isEmpty()) lists.remove(key);
         if (waiting.isEmpty()) blocked.remove(key);
@@ -313,8 +329,15 @@ public class Main {
         }
     }
 
-    static void send(SocketChannel client, String response) throws IOException {
-        client.write(ByteBuffer.wrap(response.getBytes(StandardCharsets.UTF_8)));
+    // Returns false, and closes the client, if the write failed (the client is gone).
+    static boolean send(SocketChannel client, String response) {
+        try {
+            client.write(ByteBuffer.wrap(response.getBytes(StandardCharsets.UTF_8)));
+            return true;
+        } catch (IOException e) {
+            disconnect(client);
+            return false;
+        }
     }
 
     static long[] parseId(String id, long defaultSeq) {
