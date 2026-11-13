@@ -30,6 +30,8 @@ public class Main {
     static Selector selector;
     // Clients with replies waiting in their output buffer, flushed once per loop pass.
     static final Set<SelectionKey> pending = new LinkedHashSet<>();
+    // Clients unblocked in this loop pass, whose pipelined commands after the blocking one are still to run.
+    static final Deque<SelectionKey> resumed = new ArrayDeque<>();
 
     // Each client's unparsed input, and the replies not yet written to its socket.
     static final class Connection {
@@ -38,6 +40,8 @@ public class Main {
         final Args args = new Args();
         // The commands queued after MULTI, or null outside a transaction.
         List<Args> queue;
+        // Waiting in BLPOP or XREAD BLOCK: commands it sends meanwhile stay unparsed in `in` until it is answered.
+        boolean blocked;
     }
 
     record Waiter(SocketChannel client, long deadline) {}
@@ -86,6 +90,16 @@ public class Main {
                     }
                 }
                 expire();
+                // Clients answered in this pass run what they sent after the blocking command. That can answer others.
+                while (!resumed.isEmpty()) {
+                    SelectionKey key = resumed.poll();
+                    if (!key.isValid()) continue;
+                    try {
+                        process(key);
+                    } catch (IOException e) {
+                        disconnect((SocketChannel) key.channel());
+                    }
+                }
                 for (SelectionKey key : pending) flush(key);
                 pending.clear();
             }
@@ -111,9 +125,17 @@ public class Main {
             disconnect(client);
             return;
         }
-        buffer.flip();
+        process(key);
+    }
+
+    // Runs every complete command in the client's input buffer. A command that blocks stops the loop: like Redis, the
+    // client's later commands wait until it is answered, so its replies stay in the order it sent the commands.
+    static void process(SelectionKey key) throws IOException {
+        SocketChannel client = (SocketChannel) key.channel();
+        Connection connection = (Connection) key.attachment();
+        ByteBuffer buffer = connection.in.flip();
         Args args = connection.args;
-        while (Resp.parse(buffer, args)) {
+        while (!connection.blocked && Resp.parse(buffer, args)) {
             if (args.size() > 0) run(args, client, connection);
         }
         buffer.compact();
@@ -230,10 +252,10 @@ public class Main {
             c.queue = null;
             return "+OK\r\n";
         }
-        return handleOther(args.strings(), client);
+        return handleOther(args.strings(), client, c);
     }
 
-    static String handleOther(List<String> command, SocketChannel client) throws IOException {
+    static String handleOther(List<String> command, SocketChannel client, Connection c) throws IOException {
         String name = command.get(0).toUpperCase();
         return switch (name) {
             case "TYPE" -> "+" + type(command.get(1)) + "\r\n";
@@ -280,6 +302,7 @@ public class Main {
                 if (block < 0 || executing) yield "*-1\r\n";
                 long deadline = block == 0 ? Long.MAX_VALUE : System.currentTimeMillis() + block;
                 readers.add(new Reader(client, List.copyOf(keys), after, deadline));
+                c.blocked = true;
                 yield null;
             }
             case "RPUSH" -> {
@@ -319,6 +342,7 @@ public class Main {
                 double seconds = Double.parseDouble(command.get(2));
                 long deadline = seconds == 0 ? Long.MAX_VALUE : System.currentTimeMillis() + (long) (seconds * 1000);
                 blocked.computeIfAbsent(key, k -> new ArrayDeque<>()).add(new Waiter(client, deadline));
+                c.blocked = true;
                 yield null;
             }
             case "LRANGE" -> {
@@ -351,7 +375,7 @@ public class Main {
             List<Object> result = xread(reader.keys(), reader.after());
             if (result.isEmpty()) continue;
             it.remove();
-            if (reader.client().isOpen()) send(reader.client(), array(result));
+            if (reader.client().isOpen()) answer(reader.client(), array(result));
         }
     }
 
@@ -360,7 +384,7 @@ public class Main {
         List<String> list = lists.get(key);
         while (!waiting.isEmpty() && !list.isEmpty()) {
             SocketChannel waiter = waiting.poll().client();
-            if (waiter.isOpen() && send(waiter, array(List.of(key, list.get(0))))) list.remove(0);
+            if (waiter.isOpen() && answer(waiter, array(List.of(key, list.get(0))))) list.remove(0);
         }
         if (list.isEmpty()) lists.remove(key);
         if (waiting.isEmpty()) blocked.remove(key);
@@ -385,7 +409,7 @@ public class Main {
                 Waiter waiter = waiters.next();
                 if (now >= waiter.deadline()) {
                     waiters.remove();
-                    if (waiter.client().isOpen()) send(waiter.client(), "*-1\r\n");
+                    if (waiter.client().isOpen()) answer(waiter.client(), "*-1\r\n");
                 }
             }
             if (waiting.isEmpty()) queues.remove();
@@ -395,18 +419,22 @@ public class Main {
             Reader reader = it.next();
             if (now >= reader.deadline()) {
                 it.remove();
-                if (reader.client().isOpen()) send(reader.client(), "*-1\r\n");
+                if (reader.client().isOpen()) answer(reader.client(), "*-1\r\n");
             }
         }
     }
 
-    // Queues a reply for another client (a blocked one being served); flush() writes it at the end of this loop pass.
-    // Returns false if the client is already gone.
-    static boolean send(SocketChannel client, String response) {
+    // Answers a blocked client (served, or timed out) and unblocks it. The reply goes into its output buffer now; the
+    // commands it sent while blocked run later in this loop pass, so their replies follow it. Returns false if the
+    // client is already gone.
+    static boolean answer(SocketChannel client, String response) {
         SelectionKey key = client.keyFor(selector);
         if (key == null || !key.isValid()) return false;
-        write((Connection) key.attachment(), response);
+        Connection connection = (Connection) key.attachment();
+        write(connection, response);
+        connection.blocked = false;
         pending.add(key);
+        resumed.add(key);
         return true;
     }
 
