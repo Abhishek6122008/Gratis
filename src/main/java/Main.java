@@ -33,11 +33,15 @@ public class Main {
     }
 
     public static void main(String[] args) {
-        System.out.println("Redis server started on port 6379");
+        int port = 6379;
+        for (int i = 0; i + 1 < args.length; i++) {
+            if (args[i].equals("--port")) port = Integer.parseInt(args[i + 1]);
+        }
+        System.out.println("Redis server started on port " + port);
         try {
             Selector selector = Selector.open();
             ServerSocketChannel serverChannel = ServerSocketChannel.open();
-            serverChannel.bind(new InetSocketAddress(6379));
+            serverChannel.bind(new InetSocketAddress(port));
             serverChannel.configureBlocking(false);
             serverChannel.register(selector, SelectionKey.OP_ACCEPT);
             while (true) {
