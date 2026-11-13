@@ -23,8 +23,14 @@ RUN_FILE = re.compile(r"p(\d+)-c(\d+)-r(\d+)\.json$")
 
 def load(results):
     """{target: {(pipeline, connections): [run dicts]}}, targets in the order they ran."""
+    # Targets in the order run.sh started them (its "<target> image:" lines in meta.txt), then any others by name.
+    meta = results / "meta.txt"
+    order = [line.split(" image:")[0].replace("@", "-") for line in meta.read_text().splitlines()
+             if " image:" in line] if meta.exists() else []
+    dirs = sorted((d for d in results.iterdir() if d.is_dir()),
+                  key=lambda d: (order.index(d.name) if d.name in order else len(order), d.name))
     data = {}
-    for target_dir in sorted((d for d in results.iterdir() if d.is_dir()), key=lambda d: d.stat().st_mtime):
+    for target_dir in dirs:
         runs = {}
         for f in target_dir.glob("*.json"):
             m = RUN_FILE.search(f.name)
