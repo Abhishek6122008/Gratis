@@ -4,6 +4,7 @@ import java.io.IOException;
 import java.net.InetSocketAddress;
 import java.nio.channels.SelectionKey;
 import java.nio.channels.ServerSocketChannel;
+import java.util.concurrent.locks.ReentrantLock;
 
 /**
  * Starts the server: options, the shards (one event loop thread each), and the listening socket. Shard 0 accepts
@@ -25,7 +26,8 @@ public final class Server {
         if (count < 1) throw new IllegalArgumentException("--shards must be at least 1");
         Shard[] shards = new Shard[count];
         for (int i = 0; i < count; i++) shards[i] = new Shard(i);
-        for (Shard shard : shards) shard.join(shards);
+        ReentrantLock acrossShards = new ReentrantLock();
+        for (Shard shard : shards) shard.join(shards, acrossShards);
         ServerSocketChannel listener = ServerSocketChannel.open();
         listener.bind(new InetSocketAddress(port));
         listener.configureBlocking(false);

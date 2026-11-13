@@ -15,19 +15,23 @@ import java.util.Iterator;
 import java.util.List;
 import java.util.Map;
 import java.util.concurrent.ConcurrentLinkedQueue;
+import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.atomic.AtomicReference;
+import java.util.concurrent.locks.ReentrantLock;
 
 /**
  * One event loop: the clients it accepted, and the keys whose slot maps to it. Nothing here is shared with other
  * shards. A client's command for a key on another shard goes there as a run (that command plus any that follow it for
  * the same shard). The client waits, with its later commands unparsed, until the run's replies come back, so one
- * client's commands take effect in the order it sent them.
+ * client's commands take effect in the order it sent them. A command whose keys are on several shards (an EXEC, or
+ * XREAD over several streams) runs with every other shard paused.
  */
 final class Shard implements Runnable {
     // What owner() returns for a command with no keys, and for one whose keys are on more than one shard.
     static final int ANY = -1;
     static final int SPLIT = -2;
-    static final String CROSS_SHARD = "-CROSSSLOT Keys in request don't hash to the same shard\r\n";
+    static final String BLOCK_ACROSS_SHARDS =
+            "-ERR XREAD BLOCK needs all its streams on one shard: give their names a common {hash tag}\r\n";
 
     static final byte[] OK = "+OK\r\n".getBytes(StandardCharsets.US_ASCII);
     static final byte[] PONG = "+PONG\r\n".getBytes(StandardCharsets.US_ASCII);
@@ -39,6 +43,8 @@ final class Shard implements Runnable {
     final int id;
     final Selector selector;
     private Shard[] all;
+    // Held by the shard running a command across shards while the others are paused.
+    private ReentrantLock across;
 
     // String keys and values are bytes, so any value round-trips unchanged (v1 decoded them as UTF-8 text).
     final Map<Key, byte[]> store = new HashMap<>();
@@ -64,6 +70,8 @@ final class Shard implements Runnable {
     // Arguments of the run being executed here for another shard's client.
     private final Args remote = new Args();
     private int nextShard;
+    // Clients whose command across shards found another shard already running one: tried again next pass.
+    private final List<Connection> retry = new ArrayList<>();
 
     record Waiter(Connection client, long deadline) {}
 
@@ -80,8 +88,9 @@ final class Shard implements Runnable {
         selector = Selector.open();
     }
 
-    void join(Shard[] shards) {
+    void join(Shard[] shards, ReentrantLock acrossShards) {
         all = shards;
+        across = acrossShards;
         wake = new boolean[shards.length];
     }
 
@@ -89,7 +98,16 @@ final class Shard implements Runnable {
     public void run() {
         try {
             while (true) {
-                selector.select(this::ready, nextTimeout());
+                if (retry.isEmpty()) {
+                    selector.select(this::ready, nextTimeout());
+                } else {
+                    selector.selectNow(this::ready);
+                    for (Connection c : retry) {
+                        c.waiting = false;
+                        resumed.add(c);
+                    }
+                    retry.clear();
+                }
                 for (Runnable task; (task = tasks.poll()) != null; ) task.run();
                 drainInbox();
                 expire();
@@ -202,8 +220,11 @@ final class Shard implements Runnable {
             if (owner == ANY || owner == id) {
                 run(args, c, c.out);
             } else if (owner == SPLIT) {
-                if (c.queue != null && args.is(0, "EXEC")) c.queue = null;
-                c.out.put(CROSS_SHARD);
+                if (!alone(() -> runAcross(args, c))) {
+                    buffer.position(start); // another shard is running one: try this command again next pass
+                    c.waiting = true;
+                    retry.add(c);
+                }
             } else if (c.queue != null) {
                 c.exec = c.queue;   // EXEC: the shard that owns every key runs the queued commands
                 c.queue = null;
@@ -214,6 +235,70 @@ final class Shard implements Runnable {
         }
         buffer.compact();
         if (c.out.position() > 0 && !c.waiting) markPending(c);
+    }
+
+    // Runs a command whose keys are on several shards (only called while every other shard is paused): an EXEC runs
+    // each queued command on the shard that owns its keys; an XREAD reads each stream where it lives.
+    private void runAcross(Args args, Connection c) {
+        if (!args.is(0, "EXEC")) {
+            run(args, c, c.out);
+            return;
+        }
+        List<Args> queued = c.queue;
+        c.queue = null;
+        c.out.put("*" + queued.size() + "\r\n");
+        for (Args command : queued) {
+            int owner = owner(command);
+            Shard data = owner >= 0 ? all[owner] : this;
+            data.executing = true;
+            try {
+                data.run(command, c, c.out);
+            } finally {
+                data.executing = false;
+            }
+        }
+    }
+
+    // Runs task with every other shard paused, so it can read and change keys on any of them as one step. Each paused
+    // shard is parked in a task on its own loop, between passes. Returns false, without running the task, if another
+    // shard is already doing this; the caller tries again on its next pass and is paused meanwhile, so no shard ever
+    // waits on another while holding anything.
+    private boolean alone(Runnable task) {
+        if (!across.tryLock()) return false;
+        try {
+            CountDownLatch paused = new CountDownLatch(all.length - 1);
+            CountDownLatch resume = new CountDownLatch(1);
+            for (Shard other : all) {
+                if (other == this) continue;
+                other.tasks.add(() -> {
+                    paused.countDown();
+                    awaitUninterruptibly(resume);
+                });
+                other.selector.wakeup();
+            }
+            awaitUninterruptibly(paused);
+            try {
+                task.run();
+            } finally {
+                resume.countDown();
+            }
+        } finally {
+            across.unlock();
+        }
+        return true;
+    }
+
+    private static void awaitUninterruptibly(CountDownLatch latch) {
+        boolean interrupted = false;
+        while (true) {
+            try {
+                latch.await();
+                break;
+            } catch (InterruptedException e) {
+                interrupted = true;
+            }
+        }
+        if (interrupted) Thread.currentThread().interrupt();
     }
 
     // The shard that owns the command's keys: ANY if it has none, SPLIT if they are on more than one shard.
@@ -509,6 +594,9 @@ final class Shard implements Runnable {
                 List<Object> result = xread(keys, after);
                 if (!result.isEmpty()) yield array(result);
                 if (block < 0 || executing) yield "*-1\r\n";
+                for (String key : keys) {
+                    if (ownerOf(key) != this) yield BLOCK_ACROSS_SHARDS;
+                }
                 long deadline = block == 0 ? Long.MAX_VALUE : System.currentTimeMillis() + block;
                 readers.add(new Reader(c, List.copyOf(keys), after, deadline));
                 c.blocked = true;
@@ -568,7 +656,7 @@ final class Shard implements Runnable {
         List<Object> result = new ArrayList<>();
         for (int i = 0; i < keys.size(); i++) {
             List<Object> entries = new ArrayList<>();
-            for (Entry entry : streams.getOrDefault(keys.get(i), List.of())) {
+            for (Entry entry : stream(keys.get(i))) {
                 if (compare(entry, after.get(i)) > 0) entries.add(List.of(entry.id(), entry.fields()));
             }
             if (!entries.isEmpty()) result.add(List.of(keys.get(i), entries));
@@ -673,8 +761,17 @@ final class Shard implements Runnable {
         return new long[] {Long.parseLong(parts[0]), parts.length > 1 ? Long.parseLong(parts[1]) : defaultSeq};
     }
 
+    // The shard that owns a key. Commands only touch keys on their own shard, except while running across shards.
+    Shard ownerOf(String key) {
+        return all.length == 1 ? this : all[Slots.slot(key.getBytes(StandardCharsets.UTF_8)) % all.length];
+    }
+
+    List<Entry> stream(String key) {
+        return ownerOf(key).streams.getOrDefault(key, List.of());
+    }
+
     long[] lastId(String key) {
-        List<Entry> stream = streams.getOrDefault(key, List.of());
+        List<Entry> stream = stream(key);
         if (stream.isEmpty()) return new long[] {0, 0};
         Entry last = stream.get(stream.size() - 1);
         return new long[] {last.ms(), last.seq()};

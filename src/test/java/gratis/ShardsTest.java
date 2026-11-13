@@ -14,16 +14,12 @@ import java.util.concurrent.Future;
 import org.junit.jupiter.api.Test;
 
 /**
- * A server with 4 shards. Clients are handed to shards in turn, and keys go to the shard their slot maps to, so these
- * tests pick keys on every shard and use several clients to cross between shards both ways.
+ * Sharding (every ServerTest runs 4 shards). Clients are handed to shards in turn, and keys go to the shard their slot
+ * maps to, so these tests pick keys on every shard and use several clients to cross between shards both ways.
  */
 class ShardsTest extends ServerTest {
     private static final int SHARDS = 4;
 
-    @Override
-    int shards() {
-        return SHARDS;
-    }
 
     /** A key starting with prefix that lives on the given shard. */
     static String keyOn(int shard, String prefix) {
@@ -154,5 +150,78 @@ class ShardsTest extends ServerTest {
         for (String counter : counters) {
             assertEquals(bulk(String.valueOf(clients * increments / SHARDS)), client().call("GET", counter));
         }
+    }
+
+    @Test
+    void aTransactionAcrossShardsRunsAsOne() throws Exception {
+        RespClient a = client();
+        String x = keyOn(1, "x");
+        String y = keyOn(2, "y");
+        a.call("MULTI");
+        a.call("SET", x, "1");
+        a.call("SET", y, "2");
+        a.call("INCR", x);
+        a.call("GET", y);
+        assertEquals(array(OK, OK, integer(2), bulk("2")), a.call("EXEC"));
+        assertEquals(bulk("2"), client().call("GET", x));
+    }
+
+    @Test
+    void nobodySeesHalfOfATransactionAcrossShards() throws Exception {
+        String a = keyOn(0, "a");
+        String b = keyOn(3, "b");
+        RespClient writer = client();
+        writer.call("SET", a, "0");
+        writer.call("SET", b, "0");
+        List<RespClient> readers = new ArrayList<>();
+        for (int i = 0; i < 3; i++) readers.add(client());
+        ExecutorService pool = Executors.newFixedThreadPool(readers.size() + 1);
+        try {
+            Future<?> writes = pool.submit(() -> {
+                for (int i = 0; i < 300; i++) {
+                    writer.send(pipeline(List.of(new String[] {"MULTI"}, new String[] {"INCR", a},
+                            new String[] {"INCR", b}, new String[] {"EXEC"})));
+                    for (int r = 0; r < 4; r++) writer.reply();
+                }
+                return null;
+            });
+            List<Future<?>> reads = new ArrayList<>();
+            for (RespClient reader : readers) {
+                reads.add(pool.submit(() -> {
+                    for (int i = 0; i < 300; i++) {
+                        reader.send(pipeline(List.of(new String[] {"MULTI"}, new String[] {"GET", a},
+                                new String[] {"GET", b}, new String[] {"EXEC"})));
+                        for (int r = 0; r < 3; r++) reader.reply();
+                        String both = reader.reply();
+                        String[] lines = both.split("\r\n");
+                        assertEquals(lines[2], lines[4], "a and b differ: " + both.replace("\r\n", " "));
+                    }
+                    return null;
+                }));
+            }
+            writes.get();
+            for (Future<?> f : reads) f.get();
+        } finally {
+            pool.shutdown();
+        }
+        assertEquals(bulk("300"), client().call("GET", b));
+    }
+
+    @Test
+    void xreadReadsStreamsOnDifferentShards() throws Exception {
+        RespClient a = client();
+        String s1 = keyOn(0, "s");
+        String s2 = keyOn(1, "s");
+        a.call("XADD", s1, "1-1", "f", "1");
+        a.call("XADD", s2, "2-1", "g", "2");
+        assertEquals(array(array(bulk(s1), array(array(bulk("1-1"), array(bulk("f"), bulk("1"))))),
+                        array(bulk(s2), array(array(bulk("2-1"), array(bulk("g"), bulk("2")))))),
+                a.call("XREAD", "STREAMS", s1, s2, "0-0", "0-0"));
+    }
+
+    @Test
+    void xreadBlockOverStreamsOnDifferentShardsSaysToUseAHashTag() throws Exception {
+        String reply = client().call("XREAD", "BLOCK", "0", "STREAMS", keyOn(0, "s"), keyOn(1, "s"), "$", "$");
+        assertTrue(reply.startsWith("-ERR XREAD BLOCK needs all its streams on one shard"), reply);
     }
 }
