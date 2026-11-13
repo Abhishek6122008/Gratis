@@ -14,17 +14,18 @@ import java.util.Map;
 import java.util.Set;
 
 import gratis.Args;
+import gratis.Key;
 import gratis.Resp;
 
 public class Main {
-    static final Map<String, String> store = new HashMap<>();
-    static final Map<String, Long> expiries = new HashMap<>();
+    // String keys and values are bytes, so any value round-trips unchanged (v1 decoded them as UTF-8 text).
+    static final Map<Key, byte[]> store = new HashMap<>();
+    static final Map<Key, Long> expiries = new HashMap<>();
     static final Map<String, List<String>> lists = new HashMap<>();
     static final Map<String, Deque<Waiter>> blocked = new HashMap<>();
 
     static final Map<String, List<Entry>> streams = new HashMap<>();
     static final List<Reader> readers = new ArrayList<>();
-    static final Map<SocketChannel, List<List<String>>> transactions = new HashMap<>();
     static boolean executing;
     static Selector selector;
     // Clients with replies waiting in their output buffer, flushed once per loop pass.
@@ -35,6 +36,8 @@ public class Main {
         ByteBuffer in = ByteBuffer.allocate(64 * 1024);
         ByteBuffer out = ByteBuffer.allocate(16 * 1024);
         final Args args = new Args();
+        // The commands queued after MULTI, or null outside a transaction.
+        List<Args> queue;
     }
 
     record Waiter(SocketChannel client, long deadline) {}
@@ -75,11 +78,10 @@ public class Main {
                     }
                     if (key.isValid() && key.isWritable()) pending.add(key);
                     if (key.isValid() && key.isReadable()) {
-                        SocketChannel client = (SocketChannel) key.channel();
                         try {
-                            read(client, (Connection) key.attachment());
+                            read(key);
                         } catch (IOException e) {
-                            disconnect(client);
+                            disconnect((SocketChannel) key.channel());
                         }
                     }
                 }
@@ -96,7 +98,9 @@ public class Main {
     static final int MAX_REQUEST = 512 * 1024 * 1024;
 
     // One client's failed read must not stop the server for everyone else, so its IOException ends only that client.
-    static void read(SocketChannel client, Connection connection) throws IOException {
+    static void read(SelectionKey key) throws IOException {
+        SocketChannel client = (SocketChannel) key.channel();
+        Connection connection = (Connection) key.attachment();
         ByteBuffer buffer = connection.in;
         if (!buffer.hasRemaining()) {
             // The buffer holds one incomplete command that fills it: make room for the rest.
@@ -110,11 +114,10 @@ public class Main {
         buffer.flip();
         Args args = connection.args;
         while (Resp.parse(buffer, args)) {
-            if (args.size() == 0) continue;
-            String response = run(args.strings(), client);
-            if (response != null) send(client, response);
+            if (args.size() > 0) run(args, client, connection);
         }
         buffer.compact();
+        if (connection.out.position() > 0) pending.add(key);
     }
 
     static void disconnect(SocketChannel client) {
@@ -123,76 +126,116 @@ public class Main {
         } catch (IOException ignored) {
             // closing anyway
         }
-        transactions.remove(client);
         System.out.println("Client disconnected!");
     }
 
-    // A command that throws gets an error reply, the way Redis answers bad arguments, instead of ending the loop.
-    static String run(List<String> command, SocketChannel client) throws IOException {
+    // Runs one command and puts its reply in the client's output buffer. A command that throws gets an error reply, the
+    // way Redis answers bad arguments, instead of ending the loop; anything it wrote before throwing is dropped.
+    static void run(Args args, SocketChannel client, Connection connection) throws IOException {
+        int mark = connection.out.position();
+        String reply;
         try {
-            return handle(command, client);
+            reply = handle(args, client, connection);
         } catch (IndexOutOfBoundsException e) {
-            return "-ERR wrong number of arguments for '" + command.get(0).toLowerCase() + "' command\r\n";
+            connection.out.position(mark);
+            reply = "-ERR wrong number of arguments for '" + args.string(0).toLowerCase() + "' command\r\n";
         } catch (NumberFormatException e) {
-            return "-ERR value is not an integer or out of range\r\n";
+            connection.out.position(mark);
+            reply = NOT_AN_INTEGER;
         } catch (RuntimeException e) {
-            return "-ERR " + e.getMessage() + "\r\n";
+            connection.out.position(mark);
+            reply = "-ERR " + e.getMessage() + "\r\n";
         }
+        if (reply != null) write(connection, reply);
     }
 
-    static String handle(List<String> command, SocketChannel client) throws IOException {
-        String name = command.get(0).toUpperCase();
-        List<List<String>> queue = transactions.get(client);
-        if (queue != null && !name.equals("MULTI") && !name.equals("EXEC") && !name.equals("DISCARD")) {
-            queue.add(command);
+    // The string commands are the hot path (memtier sends only SET and GET). They read their arguments as bytes, write
+    // their reply straight into the output buffer and return null. Every other command goes through handleOther with
+    // its arguments as Strings and returns its reply, or null when the client is now blocked.
+    static String handle(Args args, SocketChannel client, Connection c) throws IOException {
+        if (c.queue != null && !args.is(0, "MULTI") && !args.is(0, "EXEC") && !args.is(0, "DISCARD")) {
+            c.queue.add(args.copy());
             return "+QUEUED\r\n";
         }
-        return switch (name) {
-            case "PING" -> "+PONG\r\n";
-            case "ECHO" -> bulk(command.get(1));
-            case "SET" -> {
-                String key = command.get(1);
-                store.put(key, command.get(2));
-                expiries.remove(key);
-                for (int i = 3; i + 1 < command.size(); i += 2) {
-                    long amount = Long.parseLong(command.get(i + 1));
-                    switch (command.get(i).toUpperCase()) {
-                        case "EX" -> expiries.put(key, System.currentTimeMillis() + amount * 1000);
-                        case "PX" -> expiries.put(key, System.currentTimeMillis() + amount);
-                    }
-                }
-                yield "+OK\r\n";
+        if (args.is(0, "GET")) {
+            byte[] value = get(args.key(1));
+            if (value == null) writeBytes(c, NIL);
+            else writeBulk(c, value, 0, value.length);
+            return null;
+        }
+        if (args.is(0, "SET")) {
+            // Options first, so a bad one leaves the key untouched (v1 stored the value, then failed on the option).
+            long expiresAt = 0;
+            for (int i = 3; i + 1 < args.size(); i += 2) {
+                long amount = args.number(i + 1);
+                if (args.is(i, "EX")) expiresAt = System.currentTimeMillis() + amount * 1000;
+                else if (args.is(i, "PX")) expiresAt = System.currentTimeMillis() + amount;
             }
-            case "GET" -> {
-                String value = get(command.get(1));
-                yield value == null ? "$-1\r\n" : bulk(value);
+            Key key = args.key(1);
+            int length = args.length(2);
+            byte[] old = store.get(key);
+            if (old != null && old.length == length) args.copyInto(2, old); // same size: reuse the array
+            else if (old != null) store.replace(key, args.bytes(2));
+            else store.put(key.copy(), args.bytes(2));
+            if (!expiries.isEmpty()) expiries.remove(key);
+            if (expiresAt != 0) expiries.put(key.copy(), expiresAt);
+            writeBytes(c, OK);
+            return null;
+        }
+        if (args.is(0, "INCR")) {
+            Key key = args.key(1);
+            byte[] current = get(key);
+            long value;
+            try {
+                long now = current == null ? 0 : Long.parseLong(new String(current, StandardCharsets.US_ASCII));
+                value = Math.addExact(now, 1);
+            } catch (NumberFormatException | ArithmeticException e) {
+                return NOT_AN_INTEGER;
             }
-            case "INCR" -> {
-                String current = get(command.get(1));
-                long value;
-                try {
-                    value = Math.addExact(current == null ? 0 : Long.parseLong(current), 1);
-                } catch (NumberFormatException | ArithmeticException e) {
-                    yield "-ERR value is not an integer or out of range\r\n";
-                }
-                store.put(command.get(1), String.valueOf(value));
-                yield ":" + value + "\r\n";
-            }
-            case "MULTI" -> {
-                if (queue != null) yield "-ERR MULTI calls can not be nested\r\n";
-                transactions.put(client, new ArrayList<>());
-                yield "+OK\r\n";
-            }
-            case "EXEC" -> {
-                List<List<String>> queued = transactions.remove(client);
-                if (queued == null) yield "-ERR EXEC without MULTI\r\n";
-                StringBuilder out = new StringBuilder("*" + queued.size() + "\r\n");
-                executing = true;
-                for (List<String> queuedCommand : queued) out.append(run(queuedCommand, client));
+            byte[] digits = Long.toString(value).getBytes(StandardCharsets.US_ASCII);
+            if (current == null) store.put(key.copy(), digits);
+            else store.replace(key, digits);
+            writeInteger(c, value);
+            return null;
+        }
+        if (args.is(0, "PING")) {
+            writeBytes(c, PONG);
+            return null;
+        }
+        if (args.is(0, "ECHO")) {
+            args.check(1);
+            writeBulk(c, args.array(1), args.offset(1), args.length(1));
+            return null;
+        }
+        if (args.is(0, "MULTI")) {
+            if (c.queue != null) return "-ERR MULTI calls can not be nested\r\n";
+            c.queue = new ArrayList<>();
+            return "+OK\r\n";
+        }
+        if (args.is(0, "EXEC")) {
+            List<Args> queued = c.queue;
+            if (queued == null) return "-ERR EXEC without MULTI\r\n";
+            c.queue = null;
+            write(c, "*" + queued.size() + "\r\n");
+            executing = true;
+            try {
+                for (Args command : queued) run(command, client, c);
+            } finally {
                 executing = false;
-                yield out.toString();
             }
-            case "DISCARD" -> transactions.remove(client) == null ? "-ERR DISCARD without MULTI\r\n" : "+OK\r\n";
+            return null;
+        }
+        if (args.is(0, "DISCARD")) {
+            if (c.queue == null) return "-ERR DISCARD without MULTI\r\n";
+            c.queue = null;
+            return "+OK\r\n";
+        }
+        return handleOther(args.strings(), client);
+    }
+
+    static String handleOther(List<String> command, SocketChannel client) throws IOException {
+        String name = command.get(0).toUpperCase();
+        return switch (name) {
             case "TYPE" -> "+" + type(command.get(1)) + "\r\n";
             case "XADD" -> {
                 List<Entry> stream = streams.getOrDefault(command.get(1), List.of());
@@ -357,21 +400,74 @@ public class Main {
         }
     }
 
-    // Queues a reply in the client's output buffer; flush() writes it at the end of this loop pass, together with
-    // every other reply the client got in the meantime. Returns false if the client is already gone.
+    // Queues a reply for another client (a blocked one being served); flush() writes it at the end of this loop pass.
+    // Returns false if the client is already gone.
     static boolean send(SocketChannel client, String response) {
         SelectionKey key = client.keyFor(selector);
         if (key == null || !key.isValid()) return false;
-        Connection connection = (Connection) key.attachment();
-        byte[] bytes = response.getBytes(StandardCharsets.UTF_8);
-        if (connection.out.remaining() < bytes.length) {
-            int size = connection.out.capacity();
-            while (size - connection.out.position() < bytes.length) size *= 2;
-            connection.out = ByteBuffer.allocate(size).put(connection.out.flip());
-        }
-        connection.out.put(bytes);
+        write((Connection) key.attachment(), response);
         pending.add(key);
         return true;
+    }
+
+    static final byte[] OK = "+OK\r\n".getBytes(StandardCharsets.US_ASCII);
+    static final byte[] PONG = "+PONG\r\n".getBytes(StandardCharsets.US_ASCII);
+    static final byte[] NIL = "$-1\r\n".getBytes(StandardCharsets.US_ASCII);
+    static final byte[] CRLF = "\r\n".getBytes(StandardCharsets.US_ASCII);
+    static final String NOT_AN_INTEGER = "-ERR value is not an integer or out of range\r\n";
+
+    // The client's output buffer with room for at least needed more bytes; it doubles when full and never shrinks.
+    static ByteBuffer room(Connection c, int needed) {
+        ByteBuffer out = c.out;
+        if (out.remaining() < needed) {
+            int size = out.capacity();
+            while (size - out.position() < needed) size *= 2;
+            out = c.out = ByteBuffer.allocate(size).put(out.flip());
+        }
+        return out;
+    }
+
+    static void write(Connection c, String reply) {
+        byte[] bytes = reply.getBytes(StandardCharsets.UTF_8);
+        room(c, bytes.length).put(bytes);
+    }
+
+    static void writeBytes(Connection c, byte[] bytes) {
+        room(c, bytes.length).put(bytes);
+    }
+
+    static void writeBulk(Connection c, byte[] a, int offset, int length) {
+        ByteBuffer out = room(c, length + 24);
+        out.put((byte) '$');
+        putNumber(out, length);
+        out.put(CRLF).put(a, offset, length).put(CRLF);
+    }
+
+    static void writeInteger(Connection c, long value) {
+        ByteBuffer out = room(c, 24);
+        out.put((byte) ':');
+        putNumber(out, value);
+        out.put(CRLF);
+    }
+
+    // Writes a decimal number as ASCII digits without making a String.
+    static void putNumber(ByteBuffer out, long value) {
+        if (value == Long.MIN_VALUE) {
+            out.put("-9223372036854775808".getBytes(StandardCharsets.US_ASCII));
+            return;
+        }
+        if (value < 0) {
+            out.put((byte) '-');
+            value = -value;
+        }
+        int digits = 1;
+        for (long rest = value; rest >= 10; rest /= 10) digits++;
+        int end = out.position() + digits;
+        for (int i = end - 1; i >= out.position(); i--) {
+            out.put(i, (byte) ('0' + value % 10));
+            value /= 10;
+        }
+        out.position(end);
     }
 
     // Writes as much of the client's queued replies as the socket takes. While some are left, the client is watched for
@@ -416,17 +512,20 @@ public class Main {
     }
 
     static String type(String key) {
-        if (get(key) != null) return "string";
+        if (get(Key.of(key)) != null) return "string";
         if (lists.containsKey(key)) return "list";
         if (streams.containsKey(key)) return "stream";
         return "none";
     }
 
-    static String get(String key) {
-        Long expiresAt = expiries.get(key);
-        if (expiresAt != null && System.currentTimeMillis() >= expiresAt) {
-            store.remove(key);
-            expiries.remove(key);
+    // The value of a string key, deleting it first if its time is up (expiry is still lazy, as in v1).
+    static byte[] get(Key key) {
+        if (!expiries.isEmpty()) {
+            Long expiresAt = expiries.get(key);
+            if (expiresAt != null && System.currentTimeMillis() >= expiresAt) {
+                store.remove(key);
+                expiries.remove(key);
+            }
         }
         return store.get(key);
     }

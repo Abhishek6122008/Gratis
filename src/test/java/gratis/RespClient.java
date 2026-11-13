@@ -38,6 +38,25 @@ final class RespClient implements AutoCloseable {
         return command.toString().getBytes(StandardCharsets.UTF_8);
     }
 
+    /** Encodes a command whose arguments are raw bytes, for values that aren't text. */
+    static byte[] encode(byte[]... args) {
+        ByteArrayOutputStream command = new ByteArrayOutputStream();
+        command.writeBytes(("*" + args.length + "\r\n").getBytes(StandardCharsets.US_ASCII));
+        for (byte[] arg : args) {
+            command.writeBytes(("$" + arg.length + "\r\n").getBytes(StandardCharsets.US_ASCII));
+            command.writeBytes(arg);
+            command.writeBytes("\r\n".getBytes(StandardCharsets.US_ASCII));
+        }
+        return command.toByteArray();
+    }
+
+    /** Reads one complete reply as the exact bytes the server sent. */
+    byte[] replyBytes() throws IOException {
+        ByteArrayOutputStream raw = new ByteArrayOutputStream();
+        readReply(raw);
+        return raw.toByteArray();
+    }
+
     /** Sends one command and returns its reply. */
     String call(String... args) throws IOException {
         send(encode(args));
