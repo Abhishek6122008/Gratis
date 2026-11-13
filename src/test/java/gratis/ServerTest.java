@@ -19,7 +19,12 @@ abstract class ServerTest {
 
     @BeforeEach
     void startServer() throws Exception {
-        server = GratisServer.start();
+        server = GratisServer.start(shards());
+    }
+
+    /** How many shards the test's server runs. */
+    int shards() {
+        return 1;
     }
 
     @AfterEach

@@ -14,9 +14,21 @@ import java.util.HashMap;
 import java.util.Iterator;
 import java.util.List;
 import java.util.Map;
+import java.util.concurrent.ConcurrentLinkedQueue;
+import java.util.concurrent.atomic.AtomicReference;
 
-/** One event loop: its clients, and the keys it owns. */
+/**
+ * One event loop: the clients it accepted, and the keys whose slot maps to it. Nothing here is shared with other
+ * shards. A client's command for a key on another shard goes there as a run (that command plus any that follow it for
+ * the same shard). The client waits, with its later commands unparsed, until the run's replies come back, so one
+ * client's commands take effect in the order it sent them.
+ */
 final class Shard implements Runnable {
+    // What owner() returns for a command with no keys, and for one whose keys are on more than one shard.
+    static final int ANY = -1;
+    static final int SPLIT = -2;
+    static final String CROSS_SHARD = "-CROSSSLOT Keys in request don't hash to the same shard\r\n";
+
     static final byte[] OK = "+OK\r\n".getBytes(StandardCharsets.US_ASCII);
     static final byte[] PONG = "+PONG\r\n".getBytes(StandardCharsets.US_ASCII);
     static final byte[] NIL = "$-1\r\n".getBytes(StandardCharsets.US_ASCII);
@@ -24,7 +36,9 @@ final class Shard implements Runnable {
     // Redis's limit for one bulk string; a request still incomplete at this size ends the client.
     static final int MAX_REQUEST = 512 * 1024 * 1024;
 
+    final int id;
     final Selector selector;
+    private Shard[] all;
 
     // String keys and values are bytes, so any value round-trips unchanged (v1 decoded them as UTF-8 text).
     final Map<Key, byte[]> store = new HashMap<>();
@@ -37,8 +51,19 @@ final class Shard implements Runnable {
 
     // Clients with replies waiting in their output buffer, flushed once per loop pass.
     private final List<Connection> pending = new ArrayList<>();
-    // Clients unblocked in this loop pass, whose pipelined commands after the blocking one are still to run.
+    // Clients unblocked in this loop pass, or whose run came back, whose pipelined commands are still to run.
     private final Deque<Connection> resumed = new ArrayDeque<>();
+
+    // Connections handed over by other shards: a run to execute here, or one of this shard's clients whose run is done.
+    // A lock-free stack; a connection is in at most one inbox at a time, so its own `next` field links it.
+    private final AtomicReference<Connection> inbox = new AtomicReference<>();
+    // New clients from the accepting shard.
+    private final ConcurrentLinkedQueue<Runnable> tasks = new ConcurrentLinkedQueue<>();
+    // Shards this pass handed work to, woken once at the end of the pass.
+    private boolean[] wake;
+    // Arguments of the run being executed here for another shard's client.
+    private final Args remote = new Args();
+    private int nextShard;
 
     record Waiter(Connection client, long deadline) {}
 
@@ -50,8 +75,14 @@ final class Shard implements Runnable {
         }
     }
 
-    Shard() throws IOException {
+    Shard(int id) throws IOException {
+        this.id = id;
         selector = Selector.open();
+    }
+
+    void join(Shard[] shards) {
+        all = shards;
+        wake = new boolean[shards.length];
     }
 
     @Override
@@ -59,6 +90,8 @@ final class Shard implements Runnable {
         try {
             while (true) {
                 selector.select(this::ready, nextTimeout());
+                for (Runnable task; (task = tasks.poll()) != null; ) task.run();
+                drainInbox();
                 expire();
                 // Clients answered in this pass run what they sent after the blocking command. That can answer others.
                 while (!resumed.isEmpty()) {
@@ -75,6 +108,12 @@ final class Shard implements Runnable {
                     flush(c);
                 }
                 pending.clear();
+                for (int i = 0; i < wake.length; i++) {
+                    if (wake[i]) {
+                        wake[i] = false;
+                        all[i].selector.wakeup();
+                    }
+                }
             }
         } catch (IOException e) {
             e.printStackTrace();
@@ -102,6 +141,21 @@ final class Shard implements Runnable {
             SocketChannel channel = listener.accept();
             if (channel == null) return;
             channel.configureBlocking(false);
+            Shard target = all[nextShard];
+            nextShard = (nextShard + 1) % all.length;
+            if (target == this) {
+                register(channel);
+            } else {
+                target.tasks.add(() -> target.register(channel));
+                target.selector.wakeup();
+            }
+        } catch (IOException e) {
+            e.printStackTrace();
+        }
+    }
+
+    private void register(SocketChannel channel) {
+        try {
             Connection c = new Connection(this, channel);
             c.key = channel.register(selector, SelectionKey.OP_READ, c);
         } catch (IOException e) {
@@ -131,16 +185,171 @@ final class Shard implements Runnable {
         process(c);
     }
 
-    // Runs every complete command in the client's input buffer. A command that blocks stops the loop: like Redis, the
-    // client's later commands wait until it is answered, so its replies stay in the order it sent the commands.
+    // Runs every complete command in the client's input buffer, here or as a run on the shard that owns its key. A
+    // command that blocks, or a run out at another shard, stops the loop: like Redis, the client's later commands wait,
+    // so its replies stay in the order it sent the commands. Its replies are written once nothing is out, which keeps
+    // one write per pipeline.
     private void process(Connection c) throws IOException {
         ByteBuffer buffer = c.in.flip();
         Args args = c.args;
-        while (!c.blocked && Resp.parse(buffer, args)) {
-            if (args.size() > 0) run(args, c);
+        while (!c.blocked && !c.waiting) {
+            int start = buffer.position();
+            if (!Resp.parse(buffer, args)) break;
+            if (args.size() == 0) continue;
+            int owner;
+            if (c.queue == null) owner = owner(args);
+            else owner = args.is(0, "EXEC") ? owner(c.queue) : ANY; // inside MULTI, commands are queued here
+            if (owner == ANY || owner == id) {
+                run(args, c, c.out);
+            } else if (owner == SPLIT) {
+                if (c.queue != null && args.is(0, "EXEC")) c.queue = null;
+                c.out.put(CROSS_SHARD);
+            } else if (c.queue != null) {
+                c.exec = c.queue;   // EXEC: the shard that owns every key runs the queued commands
+                c.queue = null;
+                send(c, owner);
+            } else {
+                dispatch(c, owner, buffer, start, args);
+            }
         }
         buffer.compact();
-        if (c.out.position() > 0) markPending(c);
+        if (c.out.position() > 0 && !c.waiting) markPending(c);
+    }
+
+    // The shard that owns the command's keys: ANY if it has none, SPLIT if they are on more than one shard.
+    int owner(Args args) {
+        if (all.length == 1 || args.size() < 2) return ANY;
+        if (args.is(0, "PING") || args.is(0, "ECHO") || args.is(0, "MULTI") || args.is(0, "EXEC")
+                || args.is(0, "DISCARD")) {
+            return ANY;
+        }
+        if (!args.is(0, "XREAD")) return shardOf(args, 1);
+        int streams = 1;
+        while (streams < args.size() && !args.is(streams, "STREAMS")) streams++;
+        int keys = (args.size() - streams - 1) / 2;
+        int owner = ANY;
+        for (int i = streams + 1; i <= streams + keys; i++) owner = combine(owner, shardOf(args, i));
+        return owner;
+    }
+
+    // The shard that owns every key in a MULTI queue.
+    int owner(List<Args> queue) {
+        int owner = ANY;
+        for (Args command : queue) owner = combine(owner, owner(command));
+        return owner;
+    }
+
+    private static int combine(int a, int b) {
+        if (a == ANY) return b;
+        if (b == ANY) return a;
+        return a == b ? a : SPLIT;
+    }
+
+    private int shardOf(Args args, int i) {
+        return Slots.slot(args.array(i), args.offset(i), args.length(i)) % all.length;
+    }
+
+    private static boolean mayBlock(Args args) {
+        return args.is(0, "BLPOP") || args.is(0, "XREAD");
+    }
+
+    // Sends a run to its shard: this command and the ones after it for the same shard, up to one that may block. The
+    // run is the commands' raw bytes, copied, because the input buffer moves on.
+    private void dispatch(Connection c, int owner, ByteBuffer buffer, int start, Args args) throws IOException {
+        Out request = c.request;
+        request.buf.clear();
+        request.put(buffer.array(), buffer.arrayOffset() + start, buffer.position() - start);
+        while (!mayBlock(args)) {
+            int next = buffer.position();
+            if (!Resp.parse(buffer, args)) break;
+            if (args.size() == 0) continue;
+            if (owner(args) != owner) {
+                buffer.position(next);
+                break;
+            }
+            request.put(buffer.array(), buffer.arrayOffset() + next, buffer.position() - next);
+        }
+        send(c, owner);
+    }
+
+    // Hands the client's run to its shard. The client waits until the run comes back.
+    private void send(Connection c, int owner) {
+        c.waiting = true;
+        c.reply.buf.clear();
+        if (all[owner].push(c)) wake[owner] = true;
+    }
+
+    // Returns true if the inbox was empty, so the caller must wake this shard; otherwise someone already will.
+    private boolean push(Connection c) {
+        Connection head;
+        do {
+            head = inbox.get();
+            c.next = head;
+        } while (!inbox.compareAndSet(head, c));
+        return head == null;
+    }
+
+    private void drainInbox() {
+        Connection stack = inbox.getAndSet(null);
+        Connection first = null;
+        while (stack != null) { // reverse, to arrival order
+            Connection next = stack.next;
+            stack.next = first;
+            first = stack;
+            stack = next;
+        }
+        while (first != null) {
+            Connection c = first;
+            first = c.next;
+            c.next = null;
+            if (c.home == this) complete(c);
+            else execute(c);
+        }
+    }
+
+    // Runs another shard's client's run here, writing the replies into its reply buffer, then sends it home. A run
+    // that ends with a command that blocks stays here until answer() sends it home.
+    private void execute(Connection c) {
+        Out reply = c.reply;
+        List<Args> transaction = c.exec;
+        if (transaction != null) {
+            c.exec = null;
+            reply.put("*" + transaction.size() + "\r\n");
+            executing = true;
+            try {
+                for (Args command : transaction) run(command, c, reply);
+            } finally {
+                executing = false;
+            }
+        } else {
+            ByteBuffer request = c.request.buf.flip();
+            try {
+                while (Resp.parse(request, remote)) {
+                    if (remote.size() == 0) continue;
+                    run(remote, c, reply);
+                    if (c.blocked) return;
+                }
+            } catch (Resp.ProtocolException e) {
+                throw new IllegalStateException("a run that parsed at home did not parse here", e);
+            }
+        }
+        sendHome(c);
+    }
+
+    private void sendHome(Connection c) {
+        if (c.home == this) complete(c);
+        else if (c.home.push(c)) wake[c.home.id] = true;
+    }
+
+    // One of this shard's clients is back from a run: its replies go out after the ones before them, and its next
+    // commands can run.
+    private void complete(Connection c) {
+        c.waiting = false;
+        if (!c.key.isValid()) return; // it went away while the run was out
+        ByteBuffer reply = c.reply.buf.flip();
+        c.out.put(reply.array(), reply.arrayOffset(), reply.limit());
+        reply.clear();
+        resumed.add(c);
     }
 
     private void close(Connection c) {
@@ -153,33 +362,32 @@ final class Shard implements Runnable {
 
     // Runs one command and puts its reply in the client's output buffer. A command that throws gets an error reply, the
     // way Redis answers bad arguments, instead of ending the loop; anything it wrote before throwing is dropped.
-    void run(Args args, Connection c) throws IOException {
-        int mark = c.out.position();
+    void run(Args args, Connection c, Out out) {
+        int mark = out.position();
         String reply;
         try {
-            reply = handle(args, c);
+            reply = handle(args, c, out);
         } catch (IndexOutOfBoundsException e) {
-            c.out.position(mark);
+            out.position(mark);
             reply = "-ERR wrong number of arguments for '" + args.string(0).toLowerCase() + "' command\r\n";
         } catch (NumberFormatException e) {
-            c.out.position(mark);
+            out.position(mark);
             reply = NOT_AN_INTEGER;
         } catch (RuntimeException e) {
-            c.out.position(mark);
+            out.position(mark);
             reply = "-ERR " + e.getMessage() + "\r\n";
         }
-        if (reply != null) c.out.put(reply);
+        if (reply != null) out.put(reply);
     }
 
     // The string commands are the hot path (memtier sends only SET and GET). They read their arguments as bytes, write
     // their reply straight into the output buffer and return null. Every other command goes through handleOther with
     // its arguments as Strings and returns its reply, or null when the client is now blocked.
-    String handle(Args args, Connection c) throws IOException {
+    String handle(Args args, Connection c, Out out) {
         if (c.queue != null && !args.is(0, "MULTI") && !args.is(0, "EXEC") && !args.is(0, "DISCARD")) {
             c.queue.add(args.copy());
             return "+QUEUED\r\n";
         }
-        Out out = c.out;
         if (args.is(0, "GET")) {
             byte[] value = get(args.key(1));
             if (value == null) out.put(NIL);
@@ -242,7 +450,7 @@ final class Shard implements Runnable {
             out.put("*" + queued.size() + "\r\n");
             executing = true;
             try {
-                for (Args command : queued) run(command, c);
+                for (Args command : queued) run(command, c, out);
             } finally {
                 executing = false;
             }
@@ -256,7 +464,7 @@ final class Shard implements Runnable {
         return handleOther(args.strings(), c);
     }
 
-    String handleOther(List<String> command, Connection c) throws IOException {
+    String handleOther(List<String> command, Connection c) {
         String name = command.get(0).toUpperCase();
         return switch (name) {
             case "TYPE" -> "+" + type(command.get(1)) + "\r\n";
@@ -429,11 +637,16 @@ final class Shard implements Runnable {
     // commands it sent while blocked run later in this loop pass, so their replies follow it. Returns false if the
     // client is already gone.
     boolean answer(Connection client, String response) {
-        if (!client.key.isValid()) return false;
-        client.out.put(response);
+        if (!client.channel.isOpen()) return false;
         client.blocked = false;
-        markPending(client);
-        resumed.add(client);
+        if (client.home == this) {
+            client.out.put(response);
+            markPending(client);
+            resumed.add(client);
+        } else {
+            client.reply.put(response); // after the replies of the commands before it in its run
+            sendHome(client);
+        }
         return true;
     }
 

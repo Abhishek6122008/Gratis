@@ -20,6 +20,15 @@ final class Connection {
     // On its shard's list of clients to flush at the end of this loop pass.
     boolean pending;
 
+    // A run out at another shard (see Shard). While `waiting`, the home shard leaves the client alone: the owning shard
+    // reads `request` (or `exec`, an EXEC's queued commands) and writes `reply`, then hands the client back. The
+    // inboxes between shards order those writes before the reads.
+    boolean waiting;
+    final Out request = new Out(1024);
+    final Out reply = new Out(1024);
+    List<Args> exec;
+    Connection next;
+
     Connection(Shard home, SocketChannel channel) {
         this.home = home;
         this.channel = channel;
