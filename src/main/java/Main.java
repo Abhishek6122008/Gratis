@@ -13,6 +13,9 @@ import java.util.List;
 import java.util.Map;
 import java.util.Set;
 
+import gratis.Args;
+import gratis.Resp;
+
 public class Main {
     static final Map<String, String> store = new HashMap<>();
     static final Map<String, Long> expiries = new HashMap<>();
@@ -31,6 +34,7 @@ public class Main {
     static final class Connection {
         ByteBuffer in = ByteBuffer.allocate(64 * 1024);
         ByteBuffer out = ByteBuffer.allocate(16 * 1024);
+        final Args args = new Args();
     }
 
     record Waiter(SocketChannel client, long deadline) {}
@@ -104,9 +108,10 @@ public class Main {
             return;
         }
         buffer.flip();
-        List<String> command;
-        while ((command = parse(buffer)) != null) {
-            String response = run(command, client);
+        Args args = connection.args;
+        while (Resp.parse(buffer, args)) {
+            if (args.size() == 0) continue;
+            String response = run(args.strings(), client);
             if (response != null) send(client, response);
         }
         buffer.compact();
@@ -438,42 +443,5 @@ public class Main {
         StringBuilder out = new StringBuilder("*" + values.size() + "\r\n");
         for (Object value : values) out.append(value instanceof List<?> list ? array(list) : bulk((String) value));
         return out.toString();
-    }
-
-    static List<String> parse(ByteBuffer buffer) {
-        int start = buffer.position();
-        String header = line(buffer);
-        if (header != null && !header.startsWith("*")) {
-            return List.of(header.trim().split("\\s+"));
-        }
-        if (header != null) {
-            int count = Integer.parseInt(header.substring(1));
-            List<String> args = new ArrayList<>();
-            while (args.size() < count) {
-                String length = line(buffer);
-                if (length == null) break;
-                int size = Integer.parseInt(length.substring(1));
-                if (buffer.remaining() < size + 2) break;
-                byte[] bytes = new byte[size];
-                buffer.get(bytes);
-                buffer.position(buffer.position() + 2);
-                args.add(new String(bytes, StandardCharsets.UTF_8));
-            }
-            if (args.size() == count) return args;
-        }
-        buffer.position(start);
-        return null;
-    }
-
-    static String line(ByteBuffer buffer) {
-        for (int i = buffer.position(); i + 1 < buffer.limit(); i++) {
-            if (buffer.get(i) == '\r' && buffer.get(i + 1) == '\n') {
-                byte[] bytes = new byte[i - buffer.position()];
-                buffer.get(bytes);
-                buffer.position(i + 2);
-                return new String(bytes, StandardCharsets.UTF_8);
-            }
-        }
-        return null;
     }
 }
