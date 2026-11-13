@@ -15,6 +15,8 @@ public final class Args {
     private int[] offsets = new int[8];
     private int[] lengths = new int[8];
     private int count;
+    // The view key(i) returns: one per Args, so one per connection, and each is used by one thread at a time.
+    private final Key view = new Key();
 
     public void clear() {
         count = 0;
@@ -59,7 +61,7 @@ public final class Args {
     /** Argument i as a key to look up: a reusable view, valid until the next call. Store {@link Key#copy()}. */
     public Key key(int i) {
         check(i);
-        return Key.LOOKUP.set(arrays[i], offsets[i], lengths[i]);
+        return view.set(arrays[i], offsets[i], lengths[i]);
     }
 
     /** Argument i as its own array. */
