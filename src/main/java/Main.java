@@ -73,7 +73,7 @@ public class Main {
                     if (key.isValid() && key.isReadable()) {
                         SocketChannel client = (SocketChannel) key.channel();
                         try {
-                            read(client, ((Connection) key.attachment()).in);
+                            read(client, (Connection) key.attachment());
                         } catch (IOException e) {
                             disconnect(client);
                         }
@@ -88,8 +88,17 @@ public class Main {
         }
     }
 
+    // Redis's limit for one bulk string; a request still incomplete at this size ends the client.
+    static final int MAX_REQUEST = 512 * 1024 * 1024;
+
     // One client's failed read must not stop the server for everyone else, so its IOException ends only that client.
-    static void read(SocketChannel client, ByteBuffer buffer) throws IOException {
+    static void read(SocketChannel client, Connection connection) throws IOException {
+        ByteBuffer buffer = connection.in;
+        if (!buffer.hasRemaining()) {
+            // The buffer holds one incomplete command that fills it: make room for the rest.
+            if (buffer.capacity() >= MAX_REQUEST) throw new IOException("request too large");
+            buffer = connection.in = ByteBuffer.allocate(Math.min(MAX_REQUEST, buffer.capacity() * 2)).put(buffer.flip());
+        }
         if (client.read(buffer) == -1) {
             disconnect(client);
             return;
