@@ -7,7 +7,7 @@ import java.util.List;
 
 /**
  * A real Gratis server in its own JVM, on a free port. The tests only talk to it over a socket, the way a client
- * would, and every test gets a fresh one because the server keeps all its state in static fields.
+ * would, and every test gets a fresh one, so no state carries over from one test to the next.
  */
 final class GratisServer implements AutoCloseable {
     private final Process process;
@@ -18,11 +18,11 @@ final class GratisServer implements AutoCloseable {
         this.port = port;
     }
 
-    static GratisServer start() throws IOException, InterruptedException {
+    static GratisServer start(int shards) throws IOException, InterruptedException {
         int port = freePort();
         String java = ProcessHandle.current().info().command().orElse("java");
         Process process = new ProcessBuilder(java, "-cp", System.getProperty("java.class.path"), "Main", "--port",
-                String.valueOf(port))
+                String.valueOf(port), "--shards", String.valueOf(shards))
                 .redirectErrorStream(true)
                 .redirectOutput(ProcessBuilder.Redirect.DISCARD)
                 .start();

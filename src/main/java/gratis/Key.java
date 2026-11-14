@@ -4,12 +4,11 @@ import java.nio.charset.StandardCharsets;
 import java.util.Arrays;
 
 /**
- * A string key as bytes. Stored keys own their array. {@link #LOOKUP} is one reusable view into a command's arguments:
- * HashMap only calls hashCode and equals on the key passed to get, replace and remove, and never keeps it, so looking a
- * key up allocates nothing. Anything that stores a key stores {@link #copy()}. One thread only, like the server.
+ * A string key as bytes. Stored keys own their array. A lookup uses a reusable view into a command's arguments
+ * ({@link Args#key(int)}): HashMap only calls hashCode and equals on the key passed to get, replace and remove, and
+ * never keeps it, so looking a key up allocates nothing. Anything that stores a key stores {@link #copy()}.
  */
 public final class Key {
-    static final Key LOOKUP = new Key();
 
     private byte[] bytes;
     private int offset;

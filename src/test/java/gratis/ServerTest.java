@@ -19,7 +19,15 @@ abstract class ServerTest {
 
     @BeforeEach
     void startServer() throws Exception {
-        server = GratisServer.start();
+        server = GratisServer.start(shards());
+    }
+
+    /**
+     * How many shards the test's server runs. Four, so every test also crosses between shards: clients are handed to
+     * shards in turn, and keys spread over all four.
+     */
+    int shards() {
+        return 4;
     }
 
     @AfterEach

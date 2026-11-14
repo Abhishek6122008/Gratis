@@ -6,8 +6,9 @@
 # instead of whichever target happened to be measured during it (Day 4 found exactly that).
 #
 # Usage: bench/run.sh TARGET...
-#   TARGET is redis, valkey, or gratis@REF (any git ref; the image is built with build-image.sh).
-#   Example: bench/run.sh gratis@v1-baseline gratis@v2 redis valkey
+#   TARGET is redis, valkey, or gratis@REF[,OPTION...] (any git ref; the image is built with build-image.sh).
+#   OPTIONs: shards=N (passes --shards N), zgc (generational ZGC instead of the default G1).
+#   Example: bench/run.sh gratis@v1-baseline gratis@v2,shards=1 gratis@v2,shards=4,zgc redis valkey
 #
 # Results go to $OUT (default bench/results/<UTC timestamp>), which git ignores: one memtier JSON file and HDR
 # histograms per run, plus meta.txt with every version and setting. bench/report.py turns them into tables and charts.
@@ -57,22 +58,42 @@ memtier() { # server, then memtier options
     --key-minimum=1 --key-maximum="$KEYS" --data-size="$DATA_SIZE" --hide-histogram "$@"
 }
 
+# A target's container and directory name: gratis@v2,shards=4 -> gratis-v2-shards-4.
+name_of() {
+  local name=${1//@/-}
+  name=${name//,/-}
+  echo "${name//=/-}"
+}
+
 alive() { # server
   docker run --rm --network "$NETWORK" "$REDIS_IMAGE" redis-cli -h "$1" ping 2>/dev/null | grep -q PONG
 }
 
 start_server() { # target: starts it with the shared limits and waits until it answers PING
-  local target=$1 server=$PREFIX${1//@/-}
-  local -a cmd
+  local target=$1 server=$PREFIX$(name_of "$1")
+  local -a cmd env=()
   case $target in
     redis) cmd=("$REDIS_IMAGE" redis-server --save "" --appendonly no --protected-mode no) ;;
     valkey) cmd=("$VALKEY_IMAGE" valkey-server --save "" --appendonly no --protected-mode no) ;;
-    gratis@*) cmd=("$("$here/build-image.sh" "${target#gratis@}")") ;;
+    gratis@*)
+      local spec=${target#gratis@} java_opts="-Xms1g -Xmx1g" args="" option
+      local -a options
+      IFS=, read -ra options <<< "$spec"
+      for option in "${options[@]:1}"; do
+        case $option in
+          shards=*) args="$args --shards ${option#shards=}" ;;
+          zgc) java_opts="$java_opts -XX:+UseZGC" ;;
+          *) echo "unknown option in $target: $option" >&2; exit 1 ;;
+        esac
+      done
+      cmd=("$("$here/build-image.sh" "${options[0]}")")
+      env=(-e "JAVA_OPTS=$java_opts" -e "GRATIS_ARGS=$args")
+      ;;
     *) echo "unknown target: $target" >&2; exit 1 ;;
   esac
   docker run -d --name "$server" --network "$NETWORK" --cpuset-cpus "$SERVER_CPUS" --memory "$SERVER_MEMORY" \
-    "${cmd[@]}" >/dev/null
-  echo "$target image: ${cmd[0]} $(docker image inspect "${cmd[0]}" --format '{{.Id}}')" >> "$OUT/meta.txt"
+    "${env[@]}" "${cmd[@]}" >/dev/null
+  echo "$target image: ${cmd[0]} $(docker image inspect "${cmd[0]}" --format '{{.Id}}') ${env[*]}" >> "$OUT/meta.txt"
   for _ in $(seq 100); do
     alive "$server" && return
     sleep 0.2
@@ -85,7 +106,7 @@ start_server() { # target: starts it with the shared limits and waits until it a
 # Runs one memtier step against a target. If memtier fails or the server stops answering, records why and returns 1,
 # so that target is dropped instead of measured dead.
 step() { # target, log file (under $OUT), then memtier options
-  local target=$1 log=$2 server=$PREFIX${1//@/-}
+  local target=$1 log=$2 server=$PREFIX$(name_of "$1")
   shift 2
   if memtier "$server" "$@" > "$OUT/$log" 2>&1 && alive "$server"; then
     return 0
@@ -110,7 +131,7 @@ step() { # target, log file (under $OUT), then memtier options
 
 live=()
 for target in "$@"; do
-  name=${target//@/-}
+  name=$(name_of "$target")
   mkdir -p "$OUT/$name"
   echo "== start $target"
   start_server "$target"
@@ -130,13 +151,13 @@ for pipeline in $PIPELINES; do
     for run in $(seq "$RUNS"); do
       still=()
       for target in "${live[@]}"; do
-        name=${target//@/-}
+        name=$(name_of "$target")
         file="$name/p$pipeline-c$connections-r$run"
         if step "$target" "$file.log" --ratio="$RATIO" --key-pattern=R:R --threads="$threads" --clients="$clients" \
             --pipeline="$pipeline" --test-time="$TEST_TIME" --distinct-client-seed \
             --json-out-file="$file.json" --hdr-file-prefix="$file"; then
           still+=("$target")
-          printf '  %-20s pipeline %-2s connections %-3s run %s: %s ops/s\n' "$target" "$pipeline" "$connections" \
+          printf '  %-28s pipeline %-2s connections %-3s run %s: %s ops/s\n' "$target" "$pipeline" "$connections" \
             "$run" "$(python3 -c 'import json,sys; print(round(json.load(open(sys.argv[1]))["ALL STATS"]["Totals"]["Ops/sec"]))' "$OUT/$file.json")"
         fi
       done
@@ -146,6 +167,6 @@ for pipeline in $PIPELINES; do
 done
 
 for target in "$@"; do
-  docker logs "$PREFIX${target//@/-}" > "$OUT/${target//@/-}/server.log" 2>&1 || true
+  docker logs "$PREFIX$(name_of "$target")" > "$OUT/$(name_of "$target")/server.log" 2>&1 || true
 done
 echo "results: $OUT"
