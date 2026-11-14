@@ -15,7 +15,8 @@ bench/run.sh gratis@39f0113 gratis@v2 redis valkey      # about 20 minutes per t
 - **Workload.** 100,000 keys, 100-byte values, SET:GET 1:10, uniform random keys. Before measuring, every key is
   written once (so GETs hit) and a 10-second warm-up runs (so the JIT has compiled the hot paths).
 - **Matrix.** 1, 4, 16, 64 and 256 connections (up to 4 memtier threads), pipeline 1 and 16, 5 runs of 20 seconds
-  each. The report gives the median and the min–max spread of the 5 runs, plus p50, p99 and p99.9 latency.
+  each, interleaved: every target is started first, then each run number goes round all targets in turn, so a
+  slow stretch on the laptop hits all of them alike. The report gives the median and the min–max spread of the 5 runs, plus p50, p99 and p99.9 latency.
 - **Output.** `bench/results/<UTC time>/`, which git ignores: memtier JSON and HDR histograms per run, logs,
   `meta.txt` (every version, digest and setting), and after `report.py`, `report.md` and PNG charts.
 - memtier only sends `SET` and `GET`, and the readiness check sends `PING`, so Gratis needed no new commands.

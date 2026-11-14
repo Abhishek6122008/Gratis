@@ -8,8 +8,10 @@ import java.util.ArrayList;
 import java.util.Deque;
 import java.util.HashMap;
 import java.util.Iterator;
+import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Map;
+import java.util.Set;
 
 public class Main {
     static final Map<String, String> store = new HashMap<>();
@@ -21,6 +23,15 @@ public class Main {
     static final List<Reader> readers = new ArrayList<>();
     static final Map<SocketChannel, List<List<String>>> transactions = new HashMap<>();
     static boolean executing;
+    static Selector selector;
+    // Clients with replies waiting in their output buffer, flushed once per loop pass.
+    static final Set<SelectionKey> pending = new LinkedHashSet<>();
+
+    // Each client's unparsed input, and the replies not yet written to its socket.
+    static final class Connection {
+        ByteBuffer in = ByteBuffer.allocate(64 * 1024);
+        ByteBuffer out = ByteBuffer.allocate(16 * 1024);
+    }
 
     record Waiter(SocketChannel client, long deadline) {}
 
@@ -39,7 +50,7 @@ public class Main {
         }
         System.out.println("Redis server started on port " + port);
         try {
-            Selector selector = Selector.open();
+            selector = Selector.open();
             ServerSocketChannel serverChannel = ServerSocketChannel.open();
             serverChannel.bind(new InetSocketAddress(port));
             serverChannel.configureBlocking(false);
@@ -55,27 +66,39 @@ public class Main {
                         SocketChannel client = server.accept();
                         if (client == null) continue;
                         client.configureBlocking(false);
-                        client.register(selector, SelectionKey.OP_READ, ByteBuffer.allocate(64 * 1024));
+                        client.register(selector, SelectionKey.OP_READ, new Connection());
                         System.out.println("Client connected!");
                     }
+                    if (key.isValid() && key.isWritable()) pending.add(key);
                     if (key.isValid() && key.isReadable()) {
                         SocketChannel client = (SocketChannel) key.channel();
                         try {
-                            read(client, (ByteBuffer) key.attachment());
+                            read(client, (Connection) key.attachment());
                         } catch (IOException e) {
                             disconnect(client);
                         }
                     }
                 }
                 expire();
+                for (SelectionKey key : pending) flush(key);
+                pending.clear();
             }
         } catch (IOException e) {
             e.printStackTrace();
         }
     }
 
+    // Redis's limit for one bulk string; a request still incomplete at this size ends the client.
+    static final int MAX_REQUEST = 512 * 1024 * 1024;
+
     // One client's failed read must not stop the server for everyone else, so its IOException ends only that client.
-    static void read(SocketChannel client, ByteBuffer buffer) throws IOException {
+    static void read(SocketChannel client, Connection connection) throws IOException {
+        ByteBuffer buffer = connection.in;
+        if (!buffer.hasRemaining()) {
+            // The buffer holds one incomplete command that fills it: make room for the rest.
+            if (buffer.capacity() >= MAX_REQUEST) throw new IOException("request too large");
+            buffer = connection.in = ByteBuffer.allocate(Math.min(MAX_REQUEST, buffer.capacity() * 2)).put(buffer.flip());
+        }
         if (client.read(buffer) == -1) {
             disconnect(client);
             return;
@@ -329,15 +352,39 @@ public class Main {
         }
     }
 
-    // Returns false, and closes the client, if the write failed (the client is gone).
+    // Queues a reply in the client's output buffer; flush() writes it at the end of this loop pass, together with
+    // every other reply the client got in the meantime. Returns false if the client is already gone.
     static boolean send(SocketChannel client, String response) {
-        try {
-            client.write(ByteBuffer.wrap(response.getBytes(StandardCharsets.UTF_8)));
-            return true;
-        } catch (IOException e) {
-            disconnect(client);
-            return false;
+        SelectionKey key = client.keyFor(selector);
+        if (key == null || !key.isValid()) return false;
+        Connection connection = (Connection) key.attachment();
+        byte[] bytes = response.getBytes(StandardCharsets.UTF_8);
+        if (connection.out.remaining() < bytes.length) {
+            int size = connection.out.capacity();
+            while (size - connection.out.position() < bytes.length) size *= 2;
+            connection.out = ByteBuffer.allocate(size).put(connection.out.flip());
         }
+        connection.out.put(bytes);
+        pending.add(key);
+        return true;
+    }
+
+    // Writes as much of the client's queued replies as the socket takes. While some are left, the client is watched for
+    // OP_WRITE instead of OP_READ: it gets no new commands read until it has read its replies, which bounds the buffer.
+    static void flush(SelectionKey key) {
+        if (!key.isValid()) return;
+        Connection connection = (Connection) key.attachment();
+        SocketChannel client = (SocketChannel) key.channel();
+        connection.out.flip();
+        try {
+            client.write(connection.out);
+        } catch (IOException e) {
+            connection.out.clear();
+            disconnect(client);
+            return;
+        }
+        connection.out.compact();
+        key.interestOps(connection.out.position() > 0 ? SelectionKey.OP_WRITE : SelectionKey.OP_READ);
     }
 
     static long[] parseId(String id, long defaultSeq) {

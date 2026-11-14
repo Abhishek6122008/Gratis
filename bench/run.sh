@@ -1,5 +1,9 @@
 #!/usr/bin/env bash
-# Runs memtier_benchmark against each target, one target at a time, with the same CPU and memory limits for all.
+# Runs memtier_benchmark against each target with the same CPU and memory limits for all. All targets start first
+# (fill + warm-up each), then the runs are interleaved: for every cell (pipeline, connections) and every run number,
+# each target gets one run in turn. Only one target is under load at any moment; the others sit idle on the same CPUs.
+# Interleaving means a slow stretch on the machine (another process, the CPU clocking down) hits every target alike,
+# instead of whichever target happened to be measured during it (Day 4 found exactly that).
 #
 # Usage: bench/run.sh TARGET...
 #   TARGET is redis, valkey, or gratis@REF (any git ref; the image is built with build-image.sh).
@@ -36,21 +40,29 @@ VALKEY_IMAGE=${VALKEY_IMAGE:-valkey/valkey:alpine@sha256:bf09d58e96d6b4524a15396
 MEMTIER_IMAGE=${MEMTIER_IMAGE:-redislabs/memtier_benchmark@sha256:41849040f6ea0b335c31ae532b1488ce47ea6e8c48a086d661f3d6953d3b599d}
 
 NETWORK=gratis-bench
-SERVER=gratis-bench-target
+PREFIX=gratis-bench-
 
 [ $# -gt 0 ] || { sed -n '2,15p' "$0"; exit 1; }
 mkdir -p "$OUT"
 docker network inspect "$NETWORK" >/dev/null 2>&1 || docker network create "$NETWORK" >/dev/null
-trap 'docker rm -f "$SERVER" >/dev/null 2>&1 || true' EXIT
+cleanup() { docker ps -aq --filter "name=^$PREFIX" | xargs -r docker rm -f >/dev/null 2>&1 || true; }
+trap cleanup EXIT
+cleanup
 
-memtier() {
+memtier() { # server, then memtier options
+  local server=$1
+  shift
   docker run --rm --network "$NETWORK" --cpuset-cpus "$CLIENT_CPUS" --user "$(id -u):$(id -g)" \
-    -v "$OUT:/out" -w /out "$MEMTIER_IMAGE" -s "$SERVER" -p 6379 --protocol=redis \
+    -v "$OUT:/out" -w /out "$MEMTIER_IMAGE" -s "$server" -p 6379 --protocol=redis \
     --key-minimum=1 --key-maximum="$KEYS" --data-size="$DATA_SIZE" --hide-histogram "$@"
 }
 
-start_server() { # Starts one target alone, with the shared limits, and waits until it answers PING.
-  local target=$1
+alive() { # server
+  docker run --rm --network "$NETWORK" "$REDIS_IMAGE" redis-cli -h "$1" ping 2>/dev/null | grep -q PONG
+}
+
+start_server() { # target: starts it with the shared limits and waits until it answers PING
+  local target=$1 server=$PREFIX${1//@/-}
   local -a cmd
   case $target in
     redis) cmd=("$REDIS_IMAGE" redis-server --save "" --appendonly no --protected-mode no) ;;
@@ -58,19 +70,31 @@ start_server() { # Starts one target alone, with the shared limits, and waits un
     gratis@*) cmd=("$("$here/build-image.sh" "${target#gratis@}")") ;;
     *) echo "unknown target: $target" >&2; exit 1 ;;
   esac
-  docker rm -f "$SERVER" >/dev/null 2>&1 || true
-  docker run -d --name "$SERVER" --network "$NETWORK" --cpuset-cpus "$SERVER_CPUS" --memory "$SERVER_MEMORY" \
+  docker run -d --name "$server" --network "$NETWORK" --cpuset-cpus "$SERVER_CPUS" --memory "$SERVER_MEMORY" \
     "${cmd[@]}" >/dev/null
   echo "$target image: ${cmd[0]} $(docker image inspect "${cmd[0]}" --format '{{.Id}}')" >> "$OUT/meta.txt"
   for _ in $(seq 100); do
-    if docker run --rm --network "$NETWORK" "$REDIS_IMAGE" redis-cli -h "$SERVER" ping 2>/dev/null | grep -q PONG; then
-      return
-    fi
+    alive "$server" && return
     sleep 0.2
   done
   echo "$target did not answer PING" >&2
-  docker logs "$SERVER" >&2
+  docker logs "$server" >&2
   exit 1
+}
+
+# Runs one memtier step against a target. If memtier fails or the server stops answering, records why and returns 1,
+# so that target is dropped instead of measured dead.
+step() { # target, log file (under $OUT), then memtier options
+  local target=$1 log=$2 server=$PREFIX${1//@/-}
+  shift 2
+  if memtier "$server" "$@" > "$OUT/$log" 2>&1 && alive "$server"; then
+    return 0
+  fi
+  {
+    echo "  $target FAILED at $log: memtier exit or server gone. Last server log lines:"
+    docker logs "$server" 2>&1 | tail -5 | sed 's/^/    /'
+  } | tee -a "$OUT/meta.txt"
+  return 1
 }
 
 {
@@ -84,54 +108,44 @@ start_server() { # Starts one target alone, with the shared limits, and waits un
   echo "          SERVER_CPUS=$SERVER_CPUS CLIENT_CPUS=$CLIENT_CPUS SERVER_MEMORY=$SERVER_MEMORY"
 } > "$OUT/meta.txt"
 
-alive() {
-  docker run --rm --network "$NETWORK" "$REDIS_IMAGE" redis-cli -h "$SERVER" ping 2>/dev/null | grep -q PONG
-}
-
-# Runs one memtier step. If memtier fails or the server stops answering, records why and returns 1, so the script
-# moves on to the next target instead of measuring a dead server.
-step() { # log file (under $OUT), then memtier options
-  local log=$1
-  shift
-  if memtier "$@" > "$OUT/$log" 2>&1 && alive; then
-    return 0
-  fi
-  {
-    echo "  FAILED at $log: memtier exit or server gone. Last server log lines:"
-    docker logs "$SERVER" 2>&1 | tail -5 | sed 's/^/    /'
-  } | tee -a "$OUT/meta.txt"
-  return 1
-}
-
-bench_target() {
-  local target=$1 name=${1//@/-}
+live=()
+for target in "$@"; do
+  name=${target//@/-}
   mkdir -p "$OUT/$name"
-  echo "== $target"
+  echo "== start $target"
   start_server "$target"
   # Fill every key once, so GETs hit, then run the JIT (and every server's caches) warm before measuring.
-  step "$name/fill.log" --ratio=1:0 --key-pattern=P:P --requests=allkeys --threads=1 --clients=1 --pipeline=64 \
-    || return 1
-  step "$name/warmup.log" --ratio="$RATIO" --key-pattern=R:R --threads=4 --clients=16 --pipeline=1 \
-    --test-time="$WARMUP_TIME" || return 1
-  for pipeline in $PIPELINES; do
-    for connections in $CONNECTIONS; do
-      local threads=$(( connections < 4 ? connections : 4 ))
-      local clients=$(( connections / threads ))
-      for run in $(seq "$RUNS"); do
-        local file="$name/p$pipeline-c$connections-r$run"
-        step "$file.log" --ratio="$RATIO" --key-pattern=R:R --threads="$threads" --clients="$clients" \
-          --pipeline="$pipeline" --test-time="$TEST_TIME" --distinct-client-seed \
-          --json-out-file="$file.json" --hdr-file-prefix="$file" || return 1
-        printf '  pipeline %-2s connections %-3s run %s: %s ops/s\n' "$pipeline" "$connections" "$run" \
-          "$(python3 -c 'import json,sys; print(round(json.load(open(sys.argv[1]))["ALL STATS"]["Totals"]["Ops/sec"]))' "$OUT/$file.json")"
+  if step "$target" "$name/fill.log" --ratio=1:0 --key-pattern=P:P --requests=allkeys --threads=1 --clients=1 \
+      --pipeline=64 \
+    && step "$target" "$name/warmup.log" --ratio="$RATIO" --key-pattern=R:R --threads=4 --clients=16 --pipeline=1 \
+      --test-time="$WARMUP_TIME"; then
+    live+=("$target")
+  fi
+done
+
+for pipeline in $PIPELINES; do
+  for connections in $CONNECTIONS; do
+    threads=$(( connections < 4 ? connections : 4 ))
+    clients=$(( connections / threads ))
+    for run in $(seq "$RUNS"); do
+      still=()
+      for target in "${live[@]}"; do
+        name=${target//@/-}
+        file="$name/p$pipeline-c$connections-r$run"
+        if step "$target" "$file.log" --ratio="$RATIO" --key-pattern=R:R --threads="$threads" --clients="$clients" \
+            --pipeline="$pipeline" --test-time="$TEST_TIME" --distinct-client-seed \
+            --json-out-file="$file.json" --hdr-file-prefix="$file"; then
+          still+=("$target")
+          printf '  %-20s pipeline %-2s connections %-3s run %s: %s ops/s\n' "$target" "$pipeline" "$connections" \
+            "$run" "$(python3 -c 'import json,sys; print(round(json.load(open(sys.argv[1]))["ALL STATS"]["Totals"]["Ops/sec"]))' "$OUT/$file.json")"
+        fi
       done
+      live=("${still[@]}")
     done
   done
-}
+done
 
 for target in "$@"; do
-  bench_target "$target" || true
-  docker logs "$SERVER" > "$OUT/${target//@/-}/server.log" 2>&1 || true
-  docker rm -f "$SERVER" >/dev/null 2>&1 || true
+  docker logs "$PREFIX${target//@/-}" > "$OUT/${target//@/-}/server.log" 2>&1 || true
 done
 echo "results: $OUT"
